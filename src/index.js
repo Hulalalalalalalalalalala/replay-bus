@@ -7,7 +7,6 @@ import {
   readFileSync,
   writeFileSync,
   truncateSync,
-  ftruncateSync,
   renameSync,
   rmSync,
   existsSync,
@@ -16,6 +15,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 const LOG_NAME = 'bus.jsonl';
+const LOG_TMP_NAME = 'bus.log.tmp';
 const SNAPSHOT_NAME = 'bus.snapshot.json';
 const SNAPSHOT_TMP_NAME = 'bus.snapshot.tmp';
 
@@ -79,6 +79,7 @@ export function createBus({ path: dir, fsync = false } = {}) {
   }
 
   const logPath = path.join(dir, LOG_NAME);
+  const logTmpPath = path.join(dir, LOG_TMP_NAME);
   const snapshotPath = path.join(dir, SNAPSHOT_NAME);
   const snapshotTmpPath = path.join(dir, SNAPSHOT_TMP_NAME);
 
@@ -90,6 +91,10 @@ export function createBus({ path: dir, fsync = false } = {}) {
   const dedup = new Map();
   // dedupKey -> { promise, resolve, reject } for first publish in flight
   const pending = new Map();
+  // dedupKey -> { promise, resolve, reject } reserved by the first
+  // in-flight batch carrying that key; lets later singles/batches share
+  // the batch's first acknowledgement just like `pending` does for singles
+  const groupPending = new Map();
   // consumer name -> position (seq of the last consumed message; 0 = none)
   const positions = new Map();
   // generation of the newest durable snapshot; 0 = no snapshot yet
@@ -103,6 +108,9 @@ export function createBus({ path: dir, fsync = false } = {}) {
   // A leftover tmp file is a snapshot that crashed mid-write. The pre-compact
   // log is still intact, so the half snapshot carries no state: drop it.
   rmSync(snapshotTmpPath, { force: true });
+  // Likewise a log tmp left behind when compact crashed before the rename:
+  // the live log (if any) is still the source of truth.
+  rmSync(logTmpPath, { force: true });
 
   if (existsSync(snapshotPath)) {
     const snap = JSON.parse(readFileSync(snapshotPath, 'utf8'));
@@ -133,20 +141,50 @@ export function createBus({ path: dir, fsync = false } = {}) {
 
   const markerLine = (gen) => JSON.stringify({ t: 'c', gen }) + '\n';
 
+  // Replay complete log lines and apply only the committed prefix.
+  // A batch is bracketed by {t:'b',id} .. entries .. {t:'bk',id}: a begin
+  // without its matching commit (crash mid-write, or overtaken by a newer
+  // begin) is severed wholesale and none of its entries take effect.
+  // Returns the byte offset just past the last committed line, so both a
+  // torn trailing write and an uncommitted batch tail can be truncated.
+  const recoverLog = (raw) => {
+    let lineStart = 0;
+    let committedEnd = 0;
+    let group = null;
+    for (let i = 0; i < raw.length; i++) {
+      if (raw[i] !== 0x0a) continue;
+      const entry = i > lineStart ? JSON.parse(raw.toString('utf8', lineStart, i)) : null;
+      if (group !== null) {
+        if (entry && entry.t === 'bk' && entry.id === group.id) {
+          for (const e of group.entries) applyEntry(e);
+          group = null;
+          committedEnd = i + 1;
+        } else if (entry && entry.t === 'b') {
+          // The previous group never committed; start tracking the new one.
+          group = { id: entry.id, entries: [] };
+        } else if (entry) {
+          group.entries.push(entry);
+        }
+      } else if (entry && entry.t === 'b') {
+        group = { id: entry.id, entries: [] };
+      } else {
+        if (entry) applyEntry(entry);
+        committedEnd = i + 1;
+      }
+      lineStart = i + 1;
+    }
+    return committedEnd;
+  };
+
   if (existsSync(logPath)) {
     const raw = readFileSync(logPath);
-    const { entries, durable } = parseLog(raw);
-    // Bytes past the final newline are a torn (partially durable) trailing
-    // write. Drop them: that publish was never acknowledged, so upstream
-    // resends it.
-    if (durable < raw.length) {
-      truncateSync(logPath, durable);
-    }
+    const { entries } = parseLog(raw);
     if (snapshotGen > 0) {
       const first = entries[0];
       if (first && first.t === 'c' && first.gen === snapshotGen) {
-        // Live post-compact log: only entries after the marker are new.
-        for (const entry of entries.slice(1)) applyEntry(entry);
+        // Live post-compact log: the marker line applies as a no-op.
+        const committedEnd = recoverLog(raw);
+        if (committedEnd < raw.length) truncateSync(logPath, committedEnd);
       } else {
         // Crash between snapshot rename and log truncation (or between
         // truncation and marker write): every byte of this log is already
@@ -155,15 +193,15 @@ export function createBus({ path: dir, fsync = false } = {}) {
         writeFileSync(logPath, markerLine(snapshotGen));
       }
     } else {
-      for (const entry of entries) {
-        if (entry.t !== 'c') applyEntry(entry);
-      }
+      const committedEnd = recoverLog(raw);
+      if (committedEnd < raw.length) truncateSync(logPath, committedEnd);
     }
   } else if (snapshotGen > 0) {
     writeFileSync(logPath, markerLine(snapshotGen));
   }
 
-  const fd = openSync(logPath, 'a');
+  // Reassigned by compact() when it closes/truncates/reopens the log.
+  let fd = openSync(logPath, 'a');
 
   let chain = Promise.resolve();
   let closed = false;
@@ -261,6 +299,10 @@ export function createBus({ path: dir, fsync = false } = {}) {
         if (inflight) {
           return inflight.promise;
         }
+        const inflightGroup = groupPending.get(dedupKey);
+        if (inflightGroup) {
+          return inflightGroup.promise;
+        }
       }
 
       // Reserve in-flight dedup at call time so concurrent resends of the
@@ -312,6 +354,184 @@ export function createBus({ path: dir, fsync = false } = {}) {
       );
 
       return promise;
+    },
+
+    publishBatch(records) {
+      // Spec: a non-array argument is always a synchronous TypeError.
+      if (!Array.isArray(records)) {
+        throw new TypeError('publishBatch: records must be an array');
+      }
+      if (closed) {
+        return Promise.reject(new Error('bus is closed'));
+      }
+
+      // Validate and serialize every record up front. Any single bad shape
+      // (or value JSON cannot carry) rejects the whole group before the
+      // serial chain is touched: seq/bytes/published/dedup/positions stay
+      // exactly as they were.
+      const prepared = [];
+      try {
+        for (const record of records) {
+          if (record === null || typeof record !== 'object' || Array.isArray(record)) {
+            throw new TypeError('publishBatch: record must be a JSON object');
+          }
+          const dedupKey = record.dedupKey;
+          if (dedupKey !== undefined && typeof dedupKey !== 'string') {
+            throw new TypeError('publishBatch: dedupKey must be a string');
+          }
+          assertJsonSafe(record);
+          // Serialize exactly once per record: the byte count used for
+          // stats and the bytes actually appended must be the same string.
+          const recordJson = JSON.stringify(record);
+          prepared.push({
+            dedupKey,
+            recordJson,
+            size: Buffer.byteLength(recordJson, 'utf8'),
+          });
+        }
+      } catch (err) {
+        return Promise.reject(err);
+      }
+      if (prepared.length === 0) {
+        return Promise.resolve([]);
+      }
+
+      // Reserve the group's first-occurrence keys at call time, mirroring
+      // publish()'s `pending`: a concurrent single or batch carrying the
+      // same key shares this group's first acknowledgement. Keys already in
+      // history or reserved by an earlier in-flight op are left alone.
+      const reservations = new Map();
+      for (const item of prepared) {
+        const key = item.dedupKey;
+        if (key === undefined) continue;
+        if (dedup.has(key) || pending.has(key) || groupPending.has(key)) continue;
+        if (reservations.has(key)) continue;
+        let resolveResult;
+        let rejectResult;
+        const promise = new Promise((resolve, reject) => {
+          resolveResult = resolve;
+          rejectResult = reject;
+        });
+        // This promise is a coordination primitive: callers that race the
+        // reservation attach their own branch (publish returns it). A group
+        // with no such racer would otherwise leave the rejection unhandled
+        // when the bus closes before the job runs. The noop branch only
+        // handles the event for the process; racers still observe it.
+        promise.catch(() => {});
+        const reservation = { promise, resolve: resolveResult, reject: rejectResult };
+        reservations.set(key, reservation);
+        groupPending.set(key, reservation);
+      }
+
+      return enqueue(() => {
+        if (closed || broken) {
+          throw new Error('bus is closed');
+        }
+
+        // Resolve the whole plan against durable state inside the serial
+        // job, so groups queued behind earlier publishes/batches observe
+        // their committed dedup keys.
+        const gid = randomUUID();
+        let nextSeq = seq;
+        const owned = new Map(); // key -> first acknowledgement within group
+        const keyAcks = new Map(); // every dedup key's resolved acknowledgement
+        const planned = prepared.map((item) => {
+          const key = item.dedupKey;
+          if (key !== undefined) {
+            const hist = dedup.get(key);
+            if (hist) {
+              const reuse = { id: hist.id, seq: hist.seq };
+              keyAcks.set(key, reuse);
+              return { reuse };
+            }
+            const earlier = owned.get(key);
+            if (earlier) {
+              return { reuse: earlier };
+            }
+          }
+          nextSeq += 1;
+          const id = randomUUID();
+          const ack = { id, seq: nextSeq };
+          if (key !== undefined) {
+            owned.set(key, ack);
+            keyAcks.set(key, ack);
+          }
+          // Splice the already-serialized record into the line so the
+          // persisted bytes are exactly what `size` counted.
+          let line = `{"t":"m","seq":${nextSeq},"id":${JSON.stringify(id)},"bytes":${item.size}`;
+          if (key !== undefined) line += `,"d":${JSON.stringify(key)}`;
+          line += `,"record":${item.recordJson}}\n`;
+          return { effective: { ack, line, size: item.size, key } };
+        });
+
+        // One begin-bracket, the group's new messages, one commit-bracket.
+        // Recovery applies the bracketed entries only when the commit is
+        // present, so a crash leaves no trace of the group.
+        const buffers = [Buffer.from(JSON.stringify({ t: 'b', id: gid }) + '\n', 'utf8')];
+        for (const part of planned) {
+          if (part.effective) {
+            buffers.push(Buffer.from(part.effective.line, 'utf8'));
+          }
+        }
+        buffers.push(Buffer.from(JSON.stringify({ t: 'bk', id: gid }) + '\n', 'utf8'));
+
+        try {
+          // Coalesce in small chunks (bounds peak memory for huge groups)
+          // and loop over partial writes. Single-buffer writeSync is used
+          // rather than writev so the append behaves identically on Windows.
+          // Everything here is synchronous inside this job, so no position
+          // write can interleave. The begin/commit brackets keep the group
+          // atomic across a crash even if a partial write occurs.
+          const CHUNK = 256;
+          for (let i = 0; i < buffers.length; i += CHUNK) {
+            const chunk = Buffer.concat(buffers.slice(i, i + CHUNK));
+            let off = 0;
+            while (off < chunk.length) {
+              const written = writeSync(fd, chunk, off, chunk.length - off);
+              if (!Number.isInteger(written) || written <= 0) {
+                throw new Error('publishBatch: write made no progress, group is not durable');
+              }
+              off += written;
+            }
+          }
+          if (fsync) fsyncSync(fd);
+        } catch (err) {
+          // Nothing is applied in memory; the uncommitted bracket is
+          // severed on reopen. Stop the bus so later writes cannot glue
+          // themselves onto the partial group. Reservations are reclaimed
+          // by the outer catch below.
+          broken = true;
+          throw err;
+        }
+
+        // Durable first, state after.
+        for (const part of planned) {
+          if (!part.effective) continue;
+          const { ack, size, key } = part.effective;
+          seq = ack.seq;
+          bytes += size;
+          published += 1;
+          if (key !== undefined) dedup.set(key, { id: ack.id, seq: ack.seq });
+        }
+
+        const acks = planned.map((part) =>
+          part.reuse ? { id: part.reuse.id, seq: part.reuse.seq } : { id: part.effective.ack.id, seq: part.effective.ack.seq },
+        );
+        for (const [key, reservation] of reservations) {
+          groupPending.delete(key);
+          reservation.resolve(keyAcks.get(key));
+        }
+        return acks;
+      }).catch((err) => {
+        // Covers write failure inside the job and rejection before the job
+        // body (closed/broken bus): release any reservation still pointing
+        // at this failed group.
+        for (const [key, reservation] of reservations) {
+          if (groupPending.get(key) === reservation) groupPending.delete(key);
+          reservation.reject(err);
+        }
+        throw err;
+      });
     },
 
     replay(from = 0) {
@@ -429,13 +649,68 @@ export function createBus({ path: dir, fsync = false } = {}) {
           closeSync(tmpFd);
         }
         renameSync(snapshotTmpPath, snapshotPath);
+        // Best-effort durability for the rename itself. If syncing the
+        // directory fails (some platforms/filesystems expose no directory
+        // fsync) leaving the old log in place is still safe: every byte of
+        // it is covered by the new snapshot, so recovery folds it
+        // harmlessly on reopen.
+        let dirSynced = false;
         try {
-          ftruncateSync(fd, 0);
-          writeSync(fd, Buffer.from(markerLine(gen), 'utf8'));
+          const dirFd = openSync(dir, 'r');
+          try {
+            fsyncSync(dirFd);
+            dirSynced = true;
+          } finally {
+            closeSync(dirFd);
+          }
+        } catch {
+          // Directory sync unavailable: the replacement below remains
+          // crash-safe via the snapshot-covered old log.
+        }
+
+        // Replacing the log must work on Windows: ftruncate() of an open
+        // append handle does not shrink the file there. Close the handle,
+        // write a fresh marker-only log to a temp name, fsync it, then
+        // atomically rename it over the old one (libuv replaces the target)
+        // and reopen. The whole swap is one synchronous segment, so no
+        // reader can observe an intermediate state.
+        closeSync(fd);
+        let replaced = false;
+        try {
+          const newFd = openSync(logTmpPath, 'w');
+          try {
+            writeSync(newFd, Buffer.from(markerLine(gen), 'utf8'));
+            fsyncSync(newFd);
+          } finally {
+            closeSync(newFd);
+          }
+          renameSync(logTmpPath, logPath);
+          replaced = true;
+          // Best-effort durability of the directory entry (may be
+          // unavailable on Windows / some filesystems); a crash here
+          // recovers to either the intact old log or the new one — both
+          // fully covered by the snapshot above.
+          if (dirSynced) {
+            const dirFd2 = openSync(dir, 'r');
+            try {
+              fsyncSync(dirFd2);
+            } finally {
+              closeSync(dirFd2);
+            }
+          }
+          fd = openSync(logPath, 'a');
           fsyncSync(fd);
         } catch (err) {
-          // If the marker did not land, later appends would sit in a log the
-          // recovery path would discard as pre-snapshot. Stop the bus instead.
+          if (!replaced) {
+            // New log never landed; the old log is fully covered by the new
+            // snapshot regardless. Reopen it so close() still works, but
+            // refuse further writes on this instance.
+            try {
+              fd = openSync(logPath, 'a');
+            } catch {
+              // Nothing usable: leave fd closed; every later op throws.
+            }
+          }
           broken = true;
           throw err;
         }
@@ -458,11 +733,23 @@ export function createBus({ path: dir, fsync = false } = {}) {
         p.reject(new Error('bus is closed'));
         pending.delete(key);
       }
+      // And every reservation held by a batch still waiting in the chain.
+      for (const [key, g] of groupPending) {
+        g.reject(new Error('bus is closed'));
+        groupPending.delete(key);
+      }
       return enqueue(() => {
+        // A failed compact may have left the append handle unusable; close
+        // must stay idempotent and never reject.
         try {
           if (fsync) fsyncSync(fd);
-        } finally {
+        } catch {
+          // Ignore: the handle may already be closed.
+        }
+        try {
           closeSync(fd);
+        } catch {
+          // Already closed by the compact failure path.
         }
       });
     },
