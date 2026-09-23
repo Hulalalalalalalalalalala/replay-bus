@@ -18,6 +18,7 @@ Node.js 20 or newer. No runtime dependencies.
 
 `createBus({ path, fsync = false }) -> Bus` (named export only).
 - `Bus.publish(record) -> Promise<{ id, seq }>`.
+- `Bus.publishBatch(records) -> Promise<Array<{ id, seq }>>` — atomic group publish: the whole group takes effect together or leaves no trace. Receipts come back in input order with the same shape as `publish`; effective members take continuously increasing seqs. A `dedupKey` repeated inside the group or already known from history reuses the first receipt and gets no new seq. A non-array argument throws `TypeError` synchronously; any illegal member rejects the whole group with `TypeError` and changes nothing (seq, bytes, published, dedup, positions). An empty batch resolves to `[]`.
 - `Bus.replay(from = 0) -> Promise<Array<{ seq, id, record }>>` — inclusive of `from`, ascending.
 - `Bus.register(name) -> number` — register a consumer and return its position (0 for a new name; re-registering never resets it). Synchronous.
 - `Bus.advance(name, to) -> number` — move a consumer's position to `to` (non-negative integer, never backwards; setting the current value is a no-op success). Synchronous.
@@ -26,7 +27,7 @@ Node.js 20 or newer. No runtime dependencies.
 - `Bus.stats() -> { seq, bytes, published, replayed }`.
 - `Bus.close() -> Promise<void>` — idempotent.
 
-Unknown consumer names are auto-registered by `advance`/`read` exactly as if `register` had been called first. Positions, the dedup table and stats survive restarts; a crash anywhere inside `compact` (half-written snapshot, torn log tail) recovers to a consistent state with no lost or duplicated messages.
+Unknown consumer names are auto-registered by `advance`/`read` exactly as if `register` had been called first. Positions, the dedup table and stats survive restarts; a crash anywhere inside `compact` (half-written snapshot, torn log tail) recovers to a consistent state with no lost or duplicated messages. A batch group is one log line, so a crash mid-batch recovers to all-or-nothing — never half a group.
 
 ## Tests
 

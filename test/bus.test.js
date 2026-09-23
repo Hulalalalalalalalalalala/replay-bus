@@ -618,9 +618,344 @@ test('compact after close rejects Error', async () => {
   await assert.rejects(bus.compact(), Error);
 });
 
+test('crash recovery: log truncated but marker not written loses nothing beyond the snapshot', async () => {
+  const dir = await freshDir();
+  let bus = createBus({ path: dir });
+  const acks = [];
+  for (let i = 1; i <= 3; i++) acks.push(await bus.publish({ i, dedupKey: `k${i}` }));
+  const statsBefore = bus.stats();
+  await bus.close();
+
+  // Simulate the crash window inside the portable truncation: the snapshot
+  // is in place, the log was rewritten empty, the marker never landed.
+  const { entries } = (() => {
+    const raw = readFileSync(path.join(dir, 'bus.jsonl'), 'utf8');
+    return { entries: raw.trim().split('\n').map((l) => JSON.parse(l)) };
+  })();
+  const snapshot = {
+    v: 1,
+    gen: 1,
+    seq: statsBefore.seq,
+    bytes: statsBefore.bytes,
+    published: statsBefore.published,
+    replayed: statsBefore.replayed,
+    positions: {},
+    dedup: entries
+      .filter((e) => e.t === 'm' && typeof e.d === 'string')
+      .map((e) => [e.d, { id: e.id, seq: e.seq }]),
+    messages: entries
+      .filter((e) => e.t === 'm')
+      .map((e) => ({ seq: e.seq, id: e.id, record: e.record })),
+  };
+  writeFileSync(path.join(dir, 'bus.snapshot.json'), JSON.stringify(snapshot));
+  writeFileSync(path.join(dir, 'bus.jsonl'), '');
+
+  bus = createBus({ path: dir });
+  assert.deepEqual(bus.stats(), statsBefore);
+  assert.deepEqual((await bus.replay(0)).map((m) => m.seq), [1, 2, 3]);
+  assert.deepEqual(await bus.publish({ i: 99, dedupKey: 'k2' }), acks[1]);
+  const ack = await bus.publish({ i: 4 });
+  assert.equal(ack.seq, 4);
+  await bus.close();
+});
+
 test('default export is removed; only named createBus is exported', async () => {
   const mod = await import('../src/index.js');
   assert.equal(typeof mod.createBus, 'function');
   assert.equal(mod.default, undefined);
+});
+
+// ---- publishBatch ----------------------------------------------------------
+
+test('publishBatch: non-array input throws TypeError synchronously', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir });
+  for (const bad of [undefined, null, 'records', 42, true, {}, { 0: { a: 1 }, length: 1 }]) {
+    assert.throws(() => bus.publishBatch(bad), TypeError);
+  }
+  assert.deepEqual(bus.stats(), { seq: 0, bytes: 0, published: 0, replayed: 0 });
+  await bus.close();
+});
+
+test('publishBatch: empty batch succeeds with empty receipts', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir });
+  assert.deepEqual(await bus.publishBatch([]), []);
+  assert.deepEqual(bus.stats(), { seq: 0, bytes: 0, published: 0, replayed: 0 });
+  const ack = await bus.publish({ a: 1 });
+  assert.equal(ack.seq, 1);
+  await bus.close();
+});
+
+test('publishBatch: receipts in input order, seqs continuous across the group', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir });
+  const first = await bus.publish({ v: 0 });
+  const records = [{ v: 1 }, { v: 2, t: '你好' }, { v: 3, nested: { x: [1, 2] } }];
+  const receipts = await bus.publishBatch(records);
+  assert.equal(receipts.length, 3);
+  assert.deepEqual(receipts.map((r) => r.seq), [2, 3, 4]);
+  for (const r of receipts) assert.equal(typeof r.id, 'string');
+  assert.notEqual(receipts[0].id, receipts[1].id);
+  const last = await bus.publish({ v: 4 });
+  assert.equal(last.seq, 5);
+
+  const got = await bus.replay(0);
+  assert.deepEqual(got.map((m) => m.seq), [1, 2, 3, 4, 5]);
+  assert.deepEqual(got.slice(1, 4).map((m) => m.record), records);
+  assert.deepEqual(got.slice(1, 4).map((m) => m.id), receipts.map((r) => r.id));
+
+  const expectedBytes =
+    Buffer.byteLength(JSON.stringify({ v: 0 }), 'utf8') +
+    records.reduce((n, r) => n + Buffer.byteLength(JSON.stringify(r), 'utf8'), 0) +
+    Buffer.byteLength(JSON.stringify({ v: 4 }), 'utf8');
+  assert.deepEqual(bus.stats(), { seq: 5, bytes: expectedBytes, published: 5, replayed: 5 });
+  assert.equal(first.seq, 1);
+  await bus.close();
+});
+
+test('publishBatch: one illegal member rejects the whole group and changes nothing', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir });
+  await bus.publish({ ok: 1, dedupKey: 'keep' });
+  bus.advance('c', 1);
+  const before = bus.stats();
+  const logBefore = readFileSync(path.join(dir, 'bus.jsonl'));
+
+  const badGroups = [
+    [{ a: 1 }, null],
+    [{ a: 1 }, [1, 2]],
+    [{ a: 1 }, 'str'],
+    [{ a: 1 }, 42],
+    [{ a: 1 }, { n: NaN }],
+    [{ a: 1 }, { n: Infinity }],
+    [{ a: 1 }, { u: undefined }],
+    [{ a: 1 }, { f: () => 1 }],
+    [{ a: 1 }, { g: 10n }],
+    [{ a: 1 }, { dedupKey: 7 }],
+  ];
+  for (const group of badGroups) {
+    await assert.rejects(bus.publishBatch(group), TypeError);
+  }
+  const circular = { x: 1 };
+  circular.self = circular;
+  await assert.rejects(bus.publishBatch([{ a: 1 }, circular]), TypeError);
+
+  // seq, bytes, published, positions and the log itself are untouched.
+  assert.deepEqual(bus.stats(), before);
+  assert.equal(bus.register('c'), 1);
+  assert.equal(readFileSync(path.join(dir, 'bus.jsonl')).equals(logBefore), true);
+  // The dedup table is untouched too.
+  const dup = await bus.publish({ other: true, dedupKey: 'keep' });
+  assert.equal(dup.seq, 1);
+  // And the bus still works.
+  const ack = await bus.publish({ ok: 2 });
+  assert.equal(ack.seq, 2);
+  await bus.close();
+});
+
+test('publishBatch: dedup inside the group and against history reuses the first receipt', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir });
+  const hist = await bus.publish({ order: 'old', dedupKey: 'k-old' });
+  const receipts = await bus.publishBatch([
+    { order: 'A', dedupKey: 'k1' },
+    { order: 'B' },
+    { order: 'A-resent', dedupKey: 'k1' }, // duplicate inside the group
+    { order: 'C', dedupKey: 'k-old' }, // duplicate of history
+    { order: 'D', dedupKey: 'k2' },
+    { order: 'D-resent', dedupKey: 'k2' },
+  ]);
+  assert.deepEqual(receipts.map((r) => r.seq), [2, 3, 2, 1, 4, 4]);
+  assert.deepEqual(receipts[2], receipts[0]);
+  assert.deepEqual(receipts[3], hist);
+  assert.deepEqual(receipts[5], receipts[4]);
+  // Only effective members got a seq.
+  assert.equal(bus.stats().published, 4);
+  assert.equal(bus.stats().seq, 4);
+  const got = await bus.replay(0);
+  assert.deepEqual(got.map((m) => m.seq), [1, 2, 3, 4]);
+  assert.deepEqual(got[1].record, { order: 'A', dedupKey: 'k1' });
+  // A resend after the batch still returns the first receipt.
+  assert.deepEqual(await bus.publish({ order: 'A-again', dedupKey: 'k1' }), receipts[0]);
+  await bus.close();
+});
+
+test('publishBatch: dedup and sequence survive reopen', async () => {
+  const dir = await freshDir();
+  let bus = createBus({ path: dir, fsync: true });
+  const receipts = await bus.publishBatch([
+    { v: 1, dedupKey: 'a' },
+    { v: 2, dedupKey: 'b' },
+    { v: 3, dedupKey: 'a' },
+  ]);
+  const before = bus.stats();
+  await bus.close();
+
+  bus = createBus({ path: dir });
+  assert.deepEqual(bus.stats(), before);
+  // Cross-restart dedup: the old keys still return their first receipts.
+  assert.deepEqual(await bus.publish({ v: 9, dedupKey: 'a' }), receipts[0]);
+  const more = await bus.publishBatch([{ v: 10, dedupKey: 'b' }, { v: 4 }]);
+  assert.deepEqual(more[0], receipts[1]);
+  assert.equal(more[1].seq, 3);
+  const got = await bus.replay(0);
+  assert.deepEqual(got.map((m) => m.seq), [1, 2, 3]);
+  assert.deepEqual(
+    got.map((m) => m.record),
+    [{ v: 1, dedupKey: 'a' }, { v: 2, dedupKey: 'b' }, { v: 4 }],
+  );
+  await bus.close();
+});
+
+test('publishBatch: torn group line after a crash leaves no half group', async () => {
+  const dir = await freshDir();
+  let bus = createBus({ path: dir });
+  await bus.publishBatch([{ v: 1 }, { v: 2 }]);
+  await bus.close();
+
+  // Simulate a crash in the middle of a batch write: the group line is only
+  // partially durable, so the whole group must vanish on recovery.
+  await appendFile(
+    path.join(dir, 'bus.jsonl'),
+    '{"t":"b","msgs":[{"seq":3,"id":"x","bytes":7,"record":{"v":3}},',
+  );
+
+  bus = createBus({ path: dir });
+  assert.equal(bus.stats().seq, 2);
+  assert.equal(bus.stats().published, 2);
+  assert.deepEqual((await bus.replay(0)).map((m) => m.seq), [1, 2]);
+  const receipts = await bus.publishBatch([{ v: 3 }, { v: 4 }]);
+  assert.deepEqual(receipts.map((r) => r.seq), [3, 4]);
+  assert.deepEqual((await bus.replay(0)).map((m) => m.seq), [1, 2, 3, 4]);
+  await bus.close();
+});
+
+test('publishBatch: single publish of a reserved key shares the batch receipt', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir, fsync: true });
+  const batchPromise = bus.publishBatch([{ v: 1, dedupKey: 'k' }, { v: 2 }]);
+  const single = await bus.publish({ v: 9, dedupKey: 'k' });
+  const receipts = await batchPromise;
+  assert.deepEqual(single, receipts[0]);
+  assert.equal(receipts[1].seq, 2);
+  assert.equal(bus.stats().published, 2);
+  await bus.close();
+});
+
+test('publishBatch: key already in flight from publish resolves to that receipt', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir, fsync: true });
+  const p = bus.publish({ v: 1, dedupKey: 'k' });
+  const batch = await bus.publishBatch([{ v: 2, dedupKey: 'k' }, { v: 3 }]);
+  const first = await p;
+  assert.deepEqual(batch[0], first);
+  assert.equal(batch[1].seq, 2);
+  assert.equal(bus.stats().published, 2);
+  await bus.close();
+});
+
+test('publishBatch: after close rejects Error and repeated close stays harmless', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir });
+  await bus.close();
+  await bus.close();
+  await assert.rejects(bus.publishBatch([{ a: 1 }]), Error);
+  await assert.rejects(bus.publishBatch([]), Error);
+});
+
+test('publishBatch: batch queued before close is rejected and nothing is written', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir });
+  const p = bus.publishBatch([{ a: 1 }, { a: 2 }]);
+  const closePromise = bus.close();
+  await assert.rejects(p, Error);
+  await closePromise;
+
+  const reopened = createBus({ path: dir });
+  assert.equal(reopened.stats().published, 0);
+  const ack = await reopened.publish({ a: 1 });
+  assert.equal(ack.seq, 1);
+  await reopened.close();
+});
+
+test('publishBatch: concurrent with publish/replay/positions/compact, seqs stay continuous', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir });
+  const jobs = [];
+  const acks = [];
+  for (let i = 0; i < 10; i++) {
+    jobs.push(
+      bus.publishBatch([{ g: i, n: 0 }, { g: i, n: 1 }]).then((rs) => {
+        acks.push(...rs);
+      }),
+    );
+    jobs.push(
+      bus.publish({ single: i }).then((r) => {
+        acks.push(r);
+      }),
+    );
+    if (i % 3 === 0) jobs.push(bus.compact());
+    if (i % 4 === 0) jobs.push(bus.replay(0));
+    if (i % 5 === 0) {
+      bus.register('c');
+      bus.advance('c', i);
+    }
+  }
+  await Promise.all(jobs);
+  const seqs = acks.map((a) => a.seq).sort((x, y) => x - y);
+  assert.deepEqual(seqs, Array.from({ length: 30 }, (_, i) => i + 1));
+  const got = await bus.replay(0);
+  assert.deepEqual(
+    got.map((m) => m.seq),
+    Array.from({ length: 30 }, (_, i) => i + 1),
+  );
+  assert.equal(bus.stats().published, 30);
+  await bus.close();
+});
+
+test('publishBatch: replay and stats are identical across compaction and reopen', async () => {
+  const dir = await freshDir();
+  let bus = createBus({ path: dir, fsync: true });
+  await bus.publishBatch([{ i: 1, dedupKey: 'x' }, { i: 2 }, { i: 3, dedupKey: 'y' }]);
+  await bus.publish({ i: 4 });
+  await bus.publishBatch([{ i: 5 }, { i: 6 }]);
+  const before = await bus.replay(0);
+  const statsBefore = bus.stats();
+  await bus.compact();
+
+  assert.deepEqual(await bus.replay(0), before);
+  assert.deepEqual(await bus.replay(3), before.slice(2));
+  assert.equal(bus.stats().seq, statsBefore.seq);
+  assert.equal(bus.stats().bytes, statsBefore.bytes);
+  assert.equal(bus.stats().published, statsBefore.published);
+  // Dedup of batch-published keys survives compaction.
+  assert.deepEqual(await bus.publish({ i: 99, dedupKey: 'x' }), { id: before[0].id, seq: 1 });
+  // The sequence continues right where it was.
+  const r = await bus.publishBatch([{ i: 7 }, { i: 8 }]);
+  assert.deepEqual(r.map((x) => x.seq), [7, 8]);
+  await bus.close();
+
+  bus = createBus({ path: dir });
+  assert.deepEqual((await bus.replay(0)).map((m) => m.seq), [1, 2, 3, 4, 5, 6, 7, 8]);
+  assert.deepEqual(await bus.publish({ i: 100, dedupKey: 'y' }), { id: before[2].id, seq: 3 });
+  await bus.close();
+});
+
+test('publishBatch: large batch takes effect at once in group order', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir });
+  const records = Array.from({ length: 2000 }, (_, i) => ({ i, pad: 'x'.repeat(20) }));
+  const receipts = await bus.publishBatch(records);
+  assert.equal(receipts.length, 2000);
+  assert.deepEqual(
+    receipts.map((r) => r.seq),
+    Array.from({ length: 2000 }, (_, i) => i + 1),
+  );
+  assert.equal(bus.stats().published, 2000);
+  assert.equal(bus.stats().seq, 2000);
+  const got = await bus.replay(0);
+  assert.deepEqual(got.map((m) => m.record), records);
+  await bus.close();
 });
 

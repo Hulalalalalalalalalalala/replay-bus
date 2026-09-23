@@ -7,7 +7,6 @@ import {
   readFileSync,
   writeFileSync,
   truncateSync,
-  ftruncateSync,
   renameSync,
   rmSync,
   existsSync,
@@ -116,14 +115,21 @@ export function createBus({ path: dir, fsync = false } = {}) {
     baseMessages = snap.messages;
   }
 
+  const applyMessage = (msg) => {
+    seq = msg.seq;
+    bytes += msg.bytes;
+    published += 1;
+    if (typeof msg.d === 'string') {
+      dedup.set(msg.d, { id: msg.id, seq: msg.seq });
+    }
+  };
+
   const applyEntry = (entry) => {
     if (entry.t === 'm') {
-      seq = entry.seq;
-      bytes += entry.bytes;
-      published += 1;
-      if (typeof entry.d === 'string') {
-        dedup.set(entry.d, { id: entry.id, seq: entry.seq });
-      }
+      applyMessage(entry);
+    } else if (entry.t === 'b') {
+      // An atomic batch group: every member lands together.
+      for (const msg of entry.msgs) applyMessage(msg);
     } else if (entry.t === 's') {
       replayed += entry.n;
     } else if (entry.t === 'p') {
@@ -163,7 +169,10 @@ export function createBus({ path: dir, fsync = false } = {}) {
     writeFileSync(logPath, markerLine(snapshotGen));
   }
 
-  const fd = openSync(logPath, 'a');
+  // `let` because compact() closes and reopens the log to truncate it in a
+  // portable way; `null` marks a log whose reopen failed (the bus is broken
+  // by then, so nothing writes through it again).
+  let fd = openSync(logPath, 'a');
 
   let chain = Promise.resolve();
   let closed = false;
@@ -187,6 +196,26 @@ export function createBus({ path: dir, fsync = false } = {}) {
   const writeLine = (entry) => {
     writeSync(fd, Buffer.from(JSON.stringify(entry) + '\n', 'utf8'));
     if (fsync) fsyncSync(fd);
+  };
+
+  // Flushing a directory is best-effort: some platforms (Windows) refuse to
+  // fsync one. A missed flush must not crash compact() — recovery stays
+  // consistent either way, because the snapshot rename is ordered before the
+  // log truncation: a lost rename leaves the intact pre-compact log, and a
+  // durable rename with an untruncated log is folded exactly once. Nothing
+  // beyond what the snapshot already covers can be lost.
+  const syncDir = () => {
+    try {
+      const dfd = openSync(dir, 'r');
+      try {
+        fsyncSync(dfd);
+      } finally {
+        closeSync(dfd);
+      }
+    } catch {
+      // Unsupported here; the rename/truncation ordering above still
+      // guarantees a consistent recovery.
+    }
   };
 
   // Position writes are synchronous (register/advance/read are synchronous
@@ -227,6 +256,12 @@ export function createBus({ path: dir, fsync = false } = {}) {
     for (const entry of entries) {
       if (entry.t === 'm' && entry.seq > pos) {
         out.push({ seq: entry.seq, id: entry.id, record: entry.record });
+      } else if (entry.t === 'b') {
+        for (const msg of entry.msgs) {
+          if (msg.seq > pos) {
+            out.push({ seq: msg.seq, id: msg.id, record: msg.record });
+          }
+        }
       }
     }
     return out;
@@ -312,6 +347,141 @@ export function createBus({ path: dir, fsync = false } = {}) {
       );
 
       return promise;
+    },
+
+    /**
+     * Atomic batch publish: every record in the group takes effect together
+     * or the group leaves no trace at all. Receipts come back in input
+     * order with the same shape as publish(); effective members take
+     * continuously increasing seqs. A dedupKey repeated inside the group or
+     * already known from history reuses the first receipt and gets no new
+     * seq. Any illegal member rejects the whole group with TypeError and
+     * changes nothing.
+     */
+    publishBatch(records) {
+      if (!Array.isArray(records)) {
+        throw new TypeError('publishBatch: records must be an array');
+      }
+      if (closed) {
+        return Promise.reject(new Error('bus is closed'));
+      }
+      // Validate every member before anything is reserved or written: the
+      // group is all-or-nothing, so an illegal member must leave seq, bytes,
+      // published, the dedup table and positions exactly as they were.
+      const sizes = new Array(records.length);
+      for (let i = 0; i < records.length; i++) {
+        const record = records[i];
+        if (record === null || typeof record !== 'object' || Array.isArray(record)) {
+          return Promise.reject(new TypeError('publishBatch: every record must be a JSON object'));
+        }
+        const dedupKey = record.dedupKey;
+        if (dedupKey !== undefined && typeof dedupKey !== 'string') {
+          return Promise.reject(new TypeError('publishBatch: dedupKey must be a string'));
+        }
+        try {
+          assertJsonSafe(record);
+        } catch (err) {
+          return Promise.reject(err);
+        }
+        sizes[i] = Buffer.byteLength(JSON.stringify(record), 'utf8');
+      }
+      // An empty batch is a successful no-op.
+      if (records.length === 0) {
+        return Promise.resolve([]);
+      }
+
+      // Reserve in-flight dedup for keys no earlier call can own, so a later
+      // publish of the same key shares this batch's receipt. Keys already in
+      // the dedup table or claimed by an earlier call are resolved against
+      // the live table when the batch job runs (chain order is call order).
+      const reserved = new Map(); // dedupKey -> { promise, resolve, reject }
+      for (const record of records) {
+        const key = record.dedupKey;
+        if (key === undefined || reserved.has(key) || dedup.has(key) || pending.has(key)) {
+          continue;
+        }
+        let resolveKey;
+        let rejectKey;
+        const promise = new Promise((resolve, reject) => {
+          resolveKey = resolve;
+          rejectKey = reject;
+        });
+        const entry = { promise, resolve: resolveKey, reject: rejectKey };
+        pending.set(key, entry);
+        reserved.set(key, entry);
+      }
+      const settleReserved = (err, receiptsByKey) => {
+        for (const [key, p] of reserved) {
+          pending.delete(key);
+          if (err) p.reject(err);
+          else p.resolve(receiptsByKey.get(key));
+        }
+      };
+
+      return enqueue(() => {
+        if (closed || broken) {
+          throw new Error('bus is closed');
+        }
+        const receipts = new Array(records.length);
+        const msgs = [];
+        const receiptsByKey = new Map();
+        let next = seq;
+        for (let i = 0; i < records.length; i++) {
+          const record = records[i];
+          const key = record.dedupKey;
+          if (key !== undefined) {
+            const first = dedup.get(key);
+            if (first) {
+              receipts[i] = { id: first.id, seq: first.seq };
+              continue;
+            }
+            const dup = receiptsByKey.get(key);
+            if (dup) {
+              receipts[i] = dup;
+              continue;
+            }
+          }
+          next += 1;
+          const id = randomUUID();
+          const receipt = { id, seq: next };
+          const msg = { seq: next, id, bytes: sizes[i], record };
+          if (key !== undefined) {
+            msg.d = key;
+            receiptsByKey.set(key, receipt);
+          }
+          msgs.push(msg);
+          receipts[i] = receipt;
+        }
+        if (msgs.length > 0) {
+          try {
+            // The whole group is a single log line: a crash leaves it either
+            // fully durable (terminated by its newline) or dropped as a torn
+            // tail on recovery — never half a group.
+            writeLine({ t: 'b', msgs });
+          } catch (err) {
+            broken = true;
+            throw err;
+          }
+        }
+        // Durable before acknowledgement: state changes only after the write
+        // (and optional fsync) succeeds.
+        for (const msg of msgs) {
+          seq = msg.seq;
+          bytes += msg.bytes;
+          published += 1;
+          if (typeof msg.d === 'string') {
+            dedup.set(msg.d, { id: msg.id, seq: msg.seq });
+          }
+        }
+        settleReserved(null, receiptsByKey);
+        return receipts;
+      }).then(
+        (receipts) => receipts,
+        (err) => {
+          settleReserved(err);
+          throw err;
+        },
+      );
     },
 
     replay(from = 0) {
@@ -403,6 +573,10 @@ export function createBus({ path: dir, fsync = false } = {}) {
         for (const entry of entries) {
           if (entry.t === 'm') {
             messages.push({ seq: entry.seq, id: entry.id, record: entry.record });
+          } else if (entry.t === 'b') {
+            for (const msg of entry.msgs) {
+              messages.push({ seq: msg.seq, id: msg.id, record: msg.record });
+            }
           }
         }
         const gen = snapshotGen + 1;
@@ -429,14 +603,27 @@ export function createBus({ path: dir, fsync = false } = {}) {
           closeSync(tmpFd);
         }
         renameSync(snapshotTmpPath, snapshotPath);
+        // Flush the directory so the rename itself is durable where the
+        // platform allows it; a failure here must not crash the compact.
+        syncDir();
+        // Portable truncation: ftruncate on an append-mode descriptor does
+        // not work on Windows, so close the log, rewrite it as just the
+        // marker line, and reopen it in append mode.
+        closeSync(fd);
+        fd = null;
         try {
-          ftruncateSync(fd, 0);
-          writeSync(fd, Buffer.from(markerLine(gen), 'utf8'));
-          fsyncSync(fd);
+          writeFileSync(logPath, markerLine(gen));
+          fd = openSync(logPath, 'a');
+          if (fsync) fsyncSync(fd);
         } catch (err) {
           // If the marker did not land, later appends would sit in a log the
           // recovery path would discard as pre-snapshot. Stop the bus instead.
           broken = true;
+          try {
+            fd = openSync(logPath, 'a');
+          } catch {
+            // The log stays closed; every later operation fails on `broken`.
+          }
           throw err;
         }
         snapshotGen = gen;
@@ -460,9 +647,12 @@ export function createBus({ path: dir, fsync = false } = {}) {
       }
       return enqueue(() => {
         try {
-          if (fsync) fsyncSync(fd);
+          if (fsync && fd !== null) fsyncSync(fd);
         } finally {
-          closeSync(fd);
+          if (fd !== null) {
+            closeSync(fd);
+            fd = null;
+          }
         }
       });
     },
