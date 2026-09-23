@@ -1,0 +1,10 @@
+{
+  "name": "replay-bus",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Append-only bus with idempotent replay",
+  "main": "src/index.js",
+  "scripts": { "test": "node --test" },
+  "engines": { "node": ">=20" }
+}
