@@ -1,6 +1,6 @@
 # replay-bus
 
-Append-only message bus for one process: every publish is durable before it is acknowledged, and a replay from a sequence number never repeats a message twice.
+Append-only message bus: every publish is durable before it is acknowledged, and a replay from a sequence number never repeats a message twice. Multiple processes may open the same bus directory; a lease-based ownership protocol keeps exactly one writer at a time.
 
 ## Requirements
 
@@ -34,7 +34,17 @@ Unknown consumer names are auto-registered by `advance`/`read` exactly as if `re
 
 ## Log layout
 
-The log is a chain of segment files in the bus directory: the active `bus.jsonl` plus finalized `bus.<index>.jsonl` segments (index order is oldest first). `truncate` seals the active segment, then deletes whole finalized segments only. Before any segment file is unlinked, a checkpoint marker is written at the head of the fresh active segment carrying the cumulative stats, the consumer positions, the dedup table and the truncation horizon; the marker is the recovery anchor, so a crash anywhere inside `truncate` (a half-written segment or marker, deletes done but not synced) recovers with no lost or duplicated messages, positions and dedup come back exactly, and repeating the same truncation is harmless.
+The log is a chain of segment files in the bus directory: the active `bus.jsonl` plus finalized `bus.<index>.jsonl` segments (index order is oldest first). `truncate` seals the active segment, then deletes whole finalized segments only. Before any segment file is unlinked, a checkpoint marker is written at the head of the fresh active segment carrying the cumulative stats, the consumer positions, the dedup table and the truncation horizon; the marker is the recovery anchor, so a crash anywhere inside `truncate` (a half-written segment or marker, deletes done but not synced) recovers with no lost or duplicated messages, positions and dedup come back exactly, and repeating the same truncation is harmless. Deleting the segments does not depend on the directory sync succeeding: a failed sync only weakens crash durability, it never skips or blocks the deletion.
+
+## Cross-process ownership
+
+Any number of processes may open the same bus directory. Exactly one of them holds write ownership at a time, arbitrated by a lock directory (`.bus.lock/lease-<epoch>`) next to the log:
+
+- Ownership is taken lazily, on the first mutating call (`publish`, `publishBatch`, `truncate`, `compact`), and renewed while the owner is alive. `close()` releases it immediately; a crashed or stopped owner is taken over once its term expires (plus a clock-skew grace, so skew can never let an expired token pass).
+- Before every durable mutation the current token is verified; a call that finds ownership gone rejects with an `Error` and writes nothing — no half lines, no visible seqs. An ex-owner stays fenced: its later publish/batch/truncate/compact calls keep rejecting while its read paths keep working.
+- Takeover replays the committed log exactly like a reopen: a predecessor's torn tail or half-written batch is severed, and the new owner continues the sequence with no gaps and no duplicates. The four stats and retained usage are merged, never reset.
+- Consumer positions and replay counters are shared by every opener (including pure readers) and live in an append-only sidecar (`bus.meta.jsonl`) that compaction and truncation never rename or delete; positions advance monotonically and call order decides between processes.
+- Read paths (`replay`, `read`, `register`, `advance`, `stats`, `usage`) never contend for ownership and keep working while another process owns the directory. A mutating call that cannot acquire ownership — a live owner keeps it, the directory is missing or unwritable — rejects with an `Error`; quota overflow stays a `RangeError`.
 
 ## Tests
 
@@ -42,6 +52,6 @@ The log is a chain of segment files in the bus directory: the active `bus.jsonl`
 
 ## Limits
 
-One process owns a bus directory; no cross-process coordination.
+One writer at a time per bus directory (coordinated as above); readers are unrestricted.
 Records must be JSON-serialisable.
 No network transport and no broker integration.
