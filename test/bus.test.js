@@ -1,7 +1,7 @@
 import { test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { rm, mkdir, appendFile } from 'node:fs/promises';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { createBus } from '../src/index.js';
@@ -1081,6 +1081,450 @@ test('publishBatch queued before close is rejected with no durable trace', async
     acks.map((a) => a.seq),
     [1, 2],
   );
+  await reopened.close();
+});
+
+// ---- truncate ---------------------------------------------------------------
+
+const segmentFiles = (dir) => readdirSync(dir).filter((n) => /^bus\.\d+\.jsonl$/.test(n));
+
+test('truncate: invalid bound throws TypeError synchronously, even after close', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir });
+  for (const bad of [-1, 1.5, NaN, '1', {}, null, true, undefined, 2n]) {
+    assert.throws(() => bus.truncate(bad), TypeError);
+  }
+  await bus.close();
+  // Still a synchronous TypeError for the shape, a rejected Error for closed.
+  assert.throws(() => bus.truncate(-1), TypeError);
+  await assert.rejects(bus.truncate(1), Error);
+  await assert.rejects(bus.truncate(0), Error);
+});
+
+test('truncate: a zero bound is a no-op and rolls no segment', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir });
+  await bus.truncate(0);
+  await bus.publish({ v: 1 });
+  await bus.truncate(0);
+  assert.deepEqual((await bus.replay(0)).map((m) => m.seq), [1]);
+  assert.deepEqual(bus.stats(), {
+    seq: 1,
+    bytes: Buffer.byteLength(JSON.stringify({ v: 1 }), 'utf8'),
+    published: 1,
+    replayed: 1,
+  });
+  // No segment file was ever created.
+  assert.deepEqual(segmentFiles(dir), []);
+  await bus.close();
+});
+
+test('truncate: a straddled segment is kept whole; a bound past the end acts as the end', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir });
+  for (let i = 1; i <= 10; i++) await bus.publish({ i });
+  const statsBefore = bus.stats();
+
+  // The whole history sits in one segment; truncating into the middle of it
+  // must not delete half of it. The active segment is rolled, though.
+  await bus.truncate(4);
+  assert.deepEqual(
+    (await bus.replay(0)).map((m) => m.seq),
+    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+  );
+  assert.equal(segmentFiles(dir).length, 1);
+
+  // No consumer is registered, so a bound past the end drops every segment.
+  await bus.truncate(99);
+  assert.deepEqual(await bus.replay(0), []);
+  assert.deepEqual(segmentFiles(dir), []);
+  // Stats keep their cumulative meaning: nothing shrinks.
+  assert.equal(bus.stats().seq, statsBefore.seq);
+  assert.equal(bus.stats().bytes, statsBefore.bytes);
+  assert.equal(bus.stats().published, statsBefore.published);
+
+  // The sequence continues where it was.
+  const ack = await bus.publish({ i: 11 });
+  assert.equal(ack.seq, 11);
+  assert.deepEqual((await bus.replay(0)).map((m) => m.seq), [11]);
+  await bus.close();
+});
+
+test('truncate: a segment is deleted only once every registered consumer has passed it', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir });
+  for (let i = 1; i <= 5; i++) await bus.publish({ i });
+  bus.register('slow'); // position 0: holds every segment
+  bus.advance('fast', 5);
+  await bus.truncate(5); // rolls, but 'slow' has not passed the segment
+  assert.deepEqual(
+    (await bus.replay(0)).map((m) => m.seq),
+    [1, 2, 3, 4, 5],
+  );
+  assert.equal(segmentFiles(dir).length, 1);
+
+  for (let i = 6; i <= 10; i++) await bus.publish({ i });
+  bus.advance('slow', 5);
+  await bus.truncate(7); // first segment (1..5) can go; the second straddles
+  assert.deepEqual(
+    (await bus.replay(0)).map((m) => m.seq),
+    [6, 7, 8, 9, 10],
+  );
+  // 'slow' sits below the horizon: it reads from the earliest survivor,
+  // the truncated gap is skipped — nothing repeated, nothing lost.
+  assert.deepEqual(
+    bus.read('slow').map((m) => m.seq),
+    [6, 7, 8, 9, 10],
+  );
+
+  bus.advance('slow', 10);
+  bus.advance('fast', 10);
+  await bus.truncate(10); // everyone past everything: the rest goes
+  assert.deepEqual(await bus.replay(0), []);
+  assert.deepEqual(segmentFiles(dir), []);
+  await bus.close();
+});
+
+test('truncate: replay of a surviving range is identical before and after', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir });
+  const records = [];
+  for (let i = 1; i <= 15; i++) {
+    records.push({ i, pad: '你好'.repeat(i % 3) });
+  }
+  for (let i = 0; i < 12; i++) await bus.publish(records[i]);
+  await bus.truncate(6); // rolls; the single segment straddles, nothing deleted
+  for (let i = 12; i < 15; i++) await bus.publish(records[i]);
+
+  const before = await bus.replay(13);
+  const statsBefore = bus.stats();
+  await bus.truncate(12); // deletes the first segment (1..12)
+
+  // The surviving range replays byte-for-byte as before: seqs, ids, records.
+  assert.deepEqual(await bus.replay(13), before);
+  assert.deepEqual(
+    (await bus.replay(0)).map((m) => m.seq),
+    [13, 14, 15],
+  );
+  assert.deepEqual((await bus.replay(0)).map((m) => m.record), records.slice(12));
+  // A start inside the deleted range begins at the earliest survivor.
+  assert.deepEqual(
+    (await bus.replay(4)).map((m) => m.seq),
+    [13, 14, 15],
+  );
+  // Only the replay counter moved.
+  assert.equal(bus.stats().seq, statsBefore.seq);
+  assert.equal(bus.stats().bytes, statsBefore.bytes);
+  assert.equal(bus.stats().published, statsBefore.published);
+  await bus.close();
+});
+
+test('truncate: a consumer positioned below the horizon reads from the earliest survivor', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir });
+  for (let i = 1; i <= 5; i++) await bus.publish({ i });
+  await bus.truncate(5); // no consumers yet: everything goes
+  assert.deepEqual(await bus.replay(0), []);
+
+  // A brand-new consumer starts at the earliest surviving message, not at 1.
+  assert.deepEqual(bus.read('late'), []);
+  for (let i = 6; i <= 8; i++) await bus.publish({ i });
+  assert.deepEqual(
+    bus.read('late').map((m) => m.seq),
+    [6, 7, 8],
+  );
+  // The position itself is still 0; the gap below the horizon is skipped.
+  assert.equal(bus.register('late'), 0);
+  bus.advance('late', 7);
+  assert.deepEqual(
+    bus.read('late').map((m) => m.seq),
+    [8],
+  );
+  await bus.close();
+});
+
+test('truncate: dedup keys keep their first acknowledgement across truncation and restart', async () => {
+  const dir = await freshDir();
+  let bus = createBus({ path: dir });
+  const first = await bus.publish({ order: 'A', dedupKey: 'k1' });
+  const second = await bus.publish({ order: 'B', dedupKey: 'k2' });
+  await bus.publish({ other: 1 });
+  await bus.truncate(3); // no consumers: every message is discarded
+  assert.deepEqual(await bus.replay(0), []);
+
+  // Resends reuse the first acknowledgement even though the messages are gone.
+  assert.deepEqual(await bus.publish({ order: 'A2', dedupKey: 'k1' }), first);
+  assert.deepEqual(await bus.publish({ order: 'B2', dedupKey: 'k2' }), second);
+  assert.equal(bus.stats().published, 3);
+  assert.equal(bus.stats().seq, 3);
+  await bus.close();
+
+  bus = createBus({ path: dir });
+  assert.deepEqual(await bus.publish({ order: 'A3', dedupKey: 'k1' }), first);
+  assert.deepEqual(await bus.publish({ order: 'B3', dedupKey: 'k2' }), second);
+  assert.equal(bus.stats().published, 3);
+  const ack = await bus.publish({ fresh: true });
+  assert.equal(ack.seq, 4);
+  assert.deepEqual((await bus.replay(0)).map((m) => m.seq), [4]);
+  await bus.close();
+});
+
+test('truncate: stats never shrink, across reopen and compaction', async () => {
+  const dir = await freshDir();
+  let bus = createBus({ path: dir, fsync: true });
+  const acks = [];
+  for (let i = 1; i <= 6; i++) acks.push(await bus.publish({ big: '你好'.repeat(i), dedupKey: `d${i}` }));
+  await bus.replay(0); // 6
+  await bus.truncate(6); // everything goes
+  const before = bus.stats();
+  assert.equal(before.seq, 6);
+  assert.equal(before.published, 6);
+  assert.equal(before.replayed, 6);
+
+  await bus.compact();
+  assert.deepEqual(bus.stats(), before);
+  await bus.close();
+
+  bus = createBus({ path: dir });
+  assert.deepEqual(bus.stats(), before);
+  assert.deepEqual(await bus.replay(0), []);
+  const ack = await bus.publish({ i: 7 });
+  assert.equal(ack.seq, 7);
+  // Truncated-away dedup keys still resolve after compaction and restart.
+  assert.deepEqual(await bus.publish({ x: 1, dedupKey: 'd2' }), acks[1]);
+  await bus.close();
+});
+
+test('truncate crash: checkpoint written but segments not yet deleted recovers consistently', async () => {
+  const dir = await freshDir();
+  // Hand-craft the post-checkpoint / pre-delete state: two finalized
+  // segments and an active log led by a truncate marker covering seqs 1..3.
+  const line = (i) =>
+    JSON.stringify({
+      t: 'm',
+      seq: i,
+      id: `id-${i}`,
+      bytes: Buffer.byteLength(JSON.stringify({ i }), 'utf8'),
+      record: { i },
+    }) + '\n';
+  writeFileSync(path.join(dir, 'bus.0000000001.jsonl'), [1, 2, 3].map(line).join(''));
+  writeFileSync(path.join(dir, 'bus.0000000002.jsonl'), [4, 5].map(line).join(''));
+  const bytes = [1, 2, 3, 4, 5].reduce((n, i) => n + Buffer.byteLength(JSON.stringify({ i }), 'utf8'), 0);
+  const marker = {
+    t: 't',
+    gen: 0,
+    horizon: 3,
+    seq: 5,
+    bytes,
+    published: 5,
+    replayed: 0,
+    positions: { c: 3 },
+    dedup: [['k1', { id: 'id-1', seq: 1 }]],
+  };
+  writeFileSync(path.join(dir, 'bus.jsonl'), JSON.stringify(marker) + '\n');
+
+  const bus = createBus({ path: dir });
+  // No loss, no duplication: state comes from the marker, messages 4..5 survive.
+  assert.deepEqual(bus.stats(), { seq: 5, bytes, published: 5, replayed: 0 });
+  assert.deepEqual((await bus.replay(0)).map((m) => m.seq), [4, 5]);
+  assert.equal(bus.register('c'), 3);
+  // The truncated segment file is reconciled away; the survivor stays.
+  assert.deepEqual(segmentFiles(dir), ['bus.0000000002.jsonl']);
+  // Dedup and positions from the marker are live.
+  assert.deepEqual(await bus.publish({ i: 99, dedupKey: 'k1' }), { id: 'id-1', seq: 1 });
+  const ack = await bus.publish({ i: 6 });
+  assert.equal(ack.seq, 6);
+  await bus.close();
+
+  // The recovered state is stable across another reopen.
+  const reopened = createBus({ path: dir });
+  assert.deepEqual((await reopened.replay(0)).map((m) => m.seq), [4, 5, 6]);
+  assert.equal(reopened.stats().published, 6);
+  await reopened.close();
+});
+
+test('truncate crash: a half-written checkpoint marker is dropped, nothing is lost', async () => {
+  const dir = await freshDir();
+  let bus = createBus({ path: dir });
+  for (let i = 1; i <= 5; i++) await bus.publish({ i });
+  await bus.truncate(3); // rolls segment 1; it straddles the bound and stays
+  await bus.close();
+
+  // Crash while the checkpoint of a later truncate was being written: the
+  // active log holds only a torn marker line.
+  writeFileSync(path.join(dir, 'bus.jsonl'), '{"t":"t","gen":0,"hor');
+
+  bus = createBus({ path: dir });
+  assert.equal(bus.stats().seq, 5);
+  assert.equal(bus.stats().published, 5);
+  assert.deepEqual((await bus.replay(0)).map((m) => m.seq), [1, 2, 3, 4, 5]);
+  const ack = await bus.publish({ i: 6 });
+  assert.equal(ack.seq, 6);
+  assert.deepEqual((await bus.replay(0)).map((m) => m.seq), [1, 2, 3, 4, 5, 6]);
+  await bus.close();
+});
+
+test('truncate: repeating the same truncation is harmless', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir });
+  for (let i = 1; i <= 4; i++) await bus.publish({ i });
+  await bus.truncate(4);
+  assert.deepEqual(await bus.replay(0), []);
+  await bus.truncate(4);
+  await bus.truncate(4);
+  assert.deepEqual(await bus.replay(0), []);
+  assert.equal(bus.stats().seq, 4);
+  assert.equal(bus.stats().published, 4);
+  await bus.close();
+
+  const reopened = createBus({ path: dir });
+  assert.equal(reopened.stats().seq, 4);
+  assert.equal(reopened.stats().published, 4);
+  assert.deepEqual(await reopened.replay(0), []);
+  const ack = await reopened.publish({ i: 5 });
+  assert.equal(ack.seq, 5);
+  await reopened.close();
+});
+
+test('truncate: batches published around a truncation keep their acks and order', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir });
+  const g1 = await bus.publishBatch([{ i: 1 }, { i: 2, dedupKey: 'k1' }]);
+  await bus.truncate(2); // no consumers: the whole segment goes
+  const g2 = await bus.publishBatch([{ i: 3 }, { i: 4 }]);
+  assert.deepEqual(
+    g2.map((a) => a.seq),
+    [3, 4],
+  );
+  assert.deepEqual((await bus.replay(0)).map((m) => m.seq), [3, 4]);
+  assert.deepEqual(await bus.publish({ i: 99, dedupKey: 'k1' }), g1[1]);
+  assert.equal(bus.stats().published, 4);
+  await bus.close();
+});
+
+test('truncate and compact compose: stats cumulative, replay and dedup stable', async () => {
+  const dir = await freshDir();
+  let bus = createBus({ path: dir, fsync: true });
+  const acks = [];
+  for (let i = 1; i <= 6; i++) acks.push(await bus.publish({ i, dedupKey: `d${i}` }));
+  bus.advance('c', 6);
+  await bus.truncate(6); // consumer past the segment: seqs 1..6 are discarded
+  assert.deepEqual(await bus.replay(0), []);
+  for (let i = 7; i <= 9; i++) acks.push(await bus.publish({ i, dedupKey: `d${i}` }));
+  const statsBeforeCompact = bus.stats();
+  await bus.compact();
+  // Neither truncation nor compaction moved the cumulative counters.
+  assert.deepEqual(bus.stats(), statsBeforeCompact);
+  // The surviving range replays exactly as before compaction.
+  assert.deepEqual(
+    (await bus.replay(0)).map((m) => m.seq),
+    [7, 8, 9],
+  );
+  // Dedup survives the truncation of the messages it points at.
+  assert.deepEqual(await bus.publish({ i: 99, dedupKey: 'd4' }), acks[3]);
+  await bus.close();
+
+  bus = createBus({ path: dir });
+  assert.equal(bus.stats().seq, 9);
+  assert.equal(bus.stats().published, 9);
+  assert.deepEqual(
+    (await bus.replay(0)).map((m) => m.seq),
+    [7, 8, 9],
+  );
+  assert.deepEqual(await bus.publish({ i: 100, dedupKey: 'd1' }), acks[0]);
+  const ack = await bus.publish({ i: 10 });
+  assert.equal(ack.seq, 10);
+  assert.deepEqual(
+    (await bus.replay(0)).map((m) => m.seq),
+    [7, 8, 9, 10],
+  );
+  await bus.close();
+});
+
+test('truncate: concurrent with publish/batch/replay/positions/compact stays consistent', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir });
+  const jobs = [];
+  for (let i = 1; i <= 24; i++) {
+    if (i % 4 === 0) {
+      jobs.push(bus.publishBatch([{ i }, { i: i + 0.5 }]));
+    } else {
+      jobs.push(bus.publish({ i }));
+    }
+    if (i % 6 === 0) jobs.push(bus.truncate(i));
+    if (i % 8 === 0) jobs.push(bus.compact());
+    if (i % 5 === 0) jobs.push(bus.replay(0));
+    if (i % 10 === 0) {
+      bus.register('c');
+      bus.advance('c', i);
+    }
+  }
+  await Promise.all(jobs);
+
+  // 18 singles + 6 batches of 2 = 30 effective messages, none ever lost.
+  assert.equal(bus.stats().published, 30);
+  assert.equal(bus.stats().seq, 30);
+  assert.equal(bus.register('c'), 20);
+  // Whatever survived truncation is a contiguous suffix: no gaps, no repeats.
+  const got = await bus.replay(0);
+  assert.ok(got.length > 0);
+  for (let k = 0; k < got.length; k++) {
+    assert.equal(got[k].seq, got[0].seq + k);
+  }
+  assert.equal(got[got.length - 1].seq, 30);
+  await bus.close();
+
+  // Reopen: the same suffix, the same cumulative stats.
+  const reopened = createBus({ path: dir });
+  const again = await reopened.replay(0);
+  assert.deepEqual(
+    again.map((m) => m.seq),
+    got.map((m) => m.seq),
+  );
+  assert.equal(reopened.stats().published, 30);
+  assert.equal(reopened.stats().seq, 30);
+  assert.equal(reopened.register('c'), 20);
+  await reopened.close();
+});
+
+test('truncate after compact: no deletable segment is a no-op; the horizon only moves with deletions', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir, fsync: true });
+  for (let i = 1; i <= 5; i++) await bus.publish({ i });
+  await bus.compact(); // messages 1..5 now live in the snapshot, not in segments
+  // No message-bearing segment exists: the bound finds nothing to delete.
+  await bus.truncate(5);
+  assert.deepEqual(
+    (await bus.replay(0)).map((m) => m.seq),
+    [1, 2, 3, 4, 5],
+  );
+
+  // Once a real segment deletion pushes the horizon past the folded
+  // messages, they are discarded like everything else at/below the horizon.
+  for (let i = 6; i <= 8; i++) await bus.publish({ i });
+  await bus.truncate(8); // no consumers: segment 6..8 goes, horizon 8
+  assert.deepEqual(await bus.replay(0), []);
+  await bus.close();
+
+  // The horizon survives the restart: folded messages stay discarded.
+  const reopened = createBus({ path: dir });
+  assert.deepEqual(await reopened.replay(0), []);
+  assert.equal(reopened.stats().seq, 8);
+  assert.equal(reopened.stats().published, 8);
+  await reopened.close();
+});
+
+test('truncate: queued before close is rejected and changes nothing', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir });
+  await bus.publish({ a: 1 });
+  const truncateP = bus.truncate(1);
+  const closeP = bus.close();
+  await assert.rejects(truncateP, Error);
+  await closeP;
+
+  const reopened = createBus({ path: dir });
+  assert.deepEqual((await reopened.replay(0)).map((m) => m.seq), [1]);
   await reopened.close();
 });
 
