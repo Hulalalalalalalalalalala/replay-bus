@@ -10,6 +10,7 @@ import {
   renameSync,
   rmSync,
   existsSync,
+  readdirSync,
 } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -18,6 +19,11 @@ const LOG_NAME = 'bus.jsonl';
 const LOG_TMP_NAME = 'bus.log.tmp';
 const SNAPSHOT_NAME = 'bus.snapshot.json';
 const SNAPSHOT_TMP_NAME = 'bus.snapshot.tmp';
+// Sealed log segments are whole files named by the (inclusive) seq range of
+// the messages they hold, so recovery can rebuild the segment list from a
+// directory scan alone — no separate metadata file to keep crash-consistent.
+const SEGMENT_RE = /^bus\.seg\.(\d+)-(\d+)\.jsonl$/;
+const SEGMENT_TMP_RE = /^bus\.seg\..*\.tmp$/;
 
 /**
  * Validate that `value` survives a compact JSON.stringify unchanged.
@@ -101,6 +107,13 @@ export function createBus({ path: dir, fsync = false } = {}) {
   let snapshotGen = 0;
   // messages folded into the snapshot, served to replay/read after truncation
   let baseMessages = [];
+  // sealed segment descriptors ({ name, first, last }), ascending by first
+  let segments = [];
+  // seq of the strongest truncation checkpoint applied during recovery;
+  // messages at or below it are already folded into the checkpoint's totals
+  let checkpointSeq = 0;
+
+  const maxSealedSeq = () => (segments.length ? segments[segments.length - 1].last : 0);
 
   // ---- synchronous recovery so stats() is correct the moment createBus returns
   mkdirSync(dir, { recursive: true });
@@ -108,9 +121,13 @@ export function createBus({ path: dir, fsync = false } = {}) {
   // A leftover tmp file is a snapshot that crashed mid-write. The pre-compact
   // log is still intact, so the half snapshot carries no state: drop it.
   rmSync(snapshotTmpPath, { force: true });
-  // Likewise a log tmp left behind when compact crashed before the rename:
-  // the live log (if any) is still the source of truth.
+  // Likewise a log tmp left behind when compact/truncate crashed before the
+  // rename: the live log (if any) is still the source of truth.
   rmSync(logTmpPath, { force: true });
+  // Same for a segment tmp: the active log still holds those messages.
+  for (const name of readdirSync(dir)) {
+    if (SEGMENT_TMP_RE.test(name)) rmSync(path.join(dir, name), { force: true });
+  }
 
   if (existsSync(snapshotPath)) {
     const snap = JSON.parse(readFileSync(snapshotPath, 'utf8'));
@@ -122,10 +139,15 @@ export function createBus({ path: dir, fsync = false } = {}) {
     for (const [key, value] of snap.dedup) dedup.set(key, value);
     for (const [name, pos] of Object.entries(snap.positions)) positions.set(name, pos);
     baseMessages = snap.messages;
+    // Messages up to the snapshot horizon are accounted by its totals.
+    checkpointSeq = seq;
   }
 
   const applyEntry = (entry) => {
     if (entry.t === 'm') {
+      // At or below the truncation checkpoint the message's contribution is
+      // already folded into the checkpoint's cumulative counters.
+      if (entry.seq <= checkpointSeq) return;
       seq = entry.seq;
       bytes += entry.bytes;
       published += 1;
@@ -136,18 +158,33 @@ export function createBus({ path: dir, fsync = false } = {}) {
       replayed += entry.n;
     } else if (entry.t === 'p') {
       positions.set(entry.name, entry.pos);
+    } else if (entry.t === 'd') {
+      // Dedup carry: keeps a key's first acknowledgement durable after the
+      // segment holding its message has been truncated away.
+      dedup.set(entry.k, { id: entry.id, seq: entry.seq });
+    } else if (entry.t === 'x') {
+      // Truncation checkpoint: cumulative counters as of the truncation,
+      // including whatever the deleted segments still held. Max-based so a
+      // stale carried checkpoint can never move the totals backwards.
+      checkpointSeq = Math.max(checkpointSeq, entry.seq);
+      seq = Math.max(seq, entry.seq);
+      bytes = Math.max(bytes, entry.bytes);
+      published = Math.max(published, entry.published);
+      replayed = Math.max(replayed, entry.replayed);
     }
   };
 
   const markerLine = (gen) => JSON.stringify({ t: 'c', gen }) + '\n';
 
-  // Replay complete log lines and apply only the committed prefix.
-  // A batch is bracketed by {t:'b',id} .. entries .. {t:'bk',id}: a begin
-  // without its matching commit (crash mid-write, or overtaken by a newer
-  // begin) is severed wholesale and none of its entries take effect.
-  // Returns the byte offset just past the last committed line, so both a
-  // torn trailing write and an uncommitted batch tail can be truncated.
-  const recoverLog = (raw) => {
+  // Split a jsonl buffer into the committed entry prefix. A batch is
+  // bracketed by {t:'b',id} .. entries .. {t:'bk',id}: a begin without its
+  // matching commit (crash mid-write, or overtaken by a newer begin) is
+  // severed wholesale and none of its entries take effect. Returns the
+  // committed entries in order plus the byte offset just past the last
+  // committed line, so both a torn trailing write and an uncommitted batch
+  // tail can be truncated.
+  const scanLog = (raw) => {
+    const committed = [];
     let lineStart = 0;
     let committedEnd = 0;
     let group = null;
@@ -156,7 +193,7 @@ export function createBus({ path: dir, fsync = false } = {}) {
       const entry = i > lineStart ? JSON.parse(raw.toString('utf8', lineStart, i)) : null;
       if (group !== null) {
         if (entry && entry.t === 'bk' && entry.id === group.id) {
-          for (const e of group.entries) applyEntry(e);
+          for (const e of group.entries) committed.push(e);
           group = null;
           committedEnd = i + 1;
         } else if (entry && entry.t === 'b') {
@@ -168,12 +205,43 @@ export function createBus({ path: dir, fsync = false } = {}) {
       } else if (entry && entry.t === 'b') {
         group = { id: entry.id, entries: [] };
       } else {
-        if (entry) applyEntry(entry);
+        if (entry) committed.push(entry);
         committedEnd = i + 1;
       }
       lineStart = i + 1;
     }
-    return committedEnd;
+    return { committed, committedEnd };
+  };
+
+  // Sealed segments, oldest first. A segment whose range is entirely covered
+  // by the snapshot was folded by a compact that crashed before removing the
+  // file: the snapshot is authoritative, so drop the duplicate.
+  const snapshotSeq = seq;
+  const found = [];
+  for (const name of readdirSync(dir)) {
+    const match = SEGMENT_RE.exec(name);
+    if (match) found.push({ name, first: Number(match[1]), last: Number(match[2]) });
+  }
+  found.sort((a, b) => a.first - b.first);
+  for (const seg of found) {
+    if (seg.last <= snapshotSeq) {
+      rmSync(path.join(dir, seg.name), { force: true });
+      continue;
+    }
+    const segPath = path.join(dir, seg.name);
+    const raw = readFileSync(segPath);
+    const { committed, committedEnd } = scanLog(raw);
+    for (const entry of committed) applyEntry(entry);
+    if (committedEnd < raw.length) truncateSync(segPath, committedEnd);
+    segments.push(seg);
+  }
+
+  // Messages at or below the sealed horizon are duplicates of segment
+  // content (a truncate crashed between landing the segment and replacing
+  // the active log); the segment copy is authoritative.
+  const applyActiveEntry = (entry) => {
+    if (entry.t === 'm' && entry.seq <= maxSealedSeq()) return;
+    applyEntry(entry);
   };
 
   if (existsSync(logPath)) {
@@ -183,7 +251,8 @@ export function createBus({ path: dir, fsync = false } = {}) {
       const first = entries[0];
       if (first && first.t === 'c' && first.gen === snapshotGen) {
         // Live post-compact log: the marker line applies as a no-op.
-        const committedEnd = recoverLog(raw);
+        const { committed, committedEnd } = scanLog(raw);
+        for (const entry of committed) applyActiveEntry(entry);
         if (committedEnd < raw.length) truncateSync(logPath, committedEnd);
       } else {
         // Crash between snapshot rename and log truncation (or between
@@ -193,14 +262,15 @@ export function createBus({ path: dir, fsync = false } = {}) {
         writeFileSync(logPath, markerLine(snapshotGen));
       }
     } else {
-      const committedEnd = recoverLog(raw);
+      const { committed, committedEnd } = scanLog(raw);
+      for (const entry of committed) applyActiveEntry(entry);
       if (committedEnd < raw.length) truncateSync(logPath, committedEnd);
     }
   } else if (snapshotGen > 0) {
     writeFileSync(logPath, markerLine(snapshotGen));
   }
 
-  // Reassigned by compact() when it closes/truncates/reopens the log.
+  // Reassigned by compact()/truncate() when they close/replace/reopen the log.
   let fd = openSync(logPath, 'a');
 
   let chain = Promise.resolve();
@@ -209,9 +279,9 @@ export function createBus({ path: dir, fsync = false } = {}) {
   // cannot glue themselves onto it. The torn tail is truncated on reopen.
   let broken = false;
 
-  // All disk mutation by publish/replay/compact happens inside this serial
-  // chain; writeSync keeps each append atomic with respect to the event loop
-  // while still returning a Promise to callers.
+  // All disk mutation by publish/replay/compact/truncate happens inside this
+  // serial chain; writeSync keeps each append atomic with respect to the
+  // event loop while still returning a Promise to callers.
   const enqueue = (job) => {
     const run = chain.then(job);
     // A failed job must not stall every later operation.
@@ -225,6 +295,23 @@ export function createBus({ path: dir, fsync = false } = {}) {
   const writeLine = (entry) => {
     writeSync(fd, Buffer.from(JSON.stringify(entry) + '\n', 'utf8'));
     if (fsync) fsyncSync(fd);
+  };
+
+  // Best-effort durability for directory entries (renames, deletions). Some
+  // platforms/filesystems expose no directory fsync; a failure here only
+  // weakens durability of the operation, never its result.
+  const syncDir = () => {
+    try {
+      const dirFd = openSync(dir, 'r');
+      try {
+        fsyncSync(dirFd);
+      } finally {
+        closeSync(dirFd);
+      }
+    } catch {
+      // Directory sync unavailable: the file-level fsyncs still order the
+      // contents; a crash recovers to a consistent pre- or post-state.
+    }
   };
 
   // Position writes are synchronous (register/advance/read are synchronous
@@ -251,7 +338,9 @@ export function createBus({ path: dir, fsync = false } = {}) {
     }
   };
 
-  // Messages with seq > pos, snapshot first then live log, ascending.
+  // Messages with seq > pos, snapshot first, then sealed segments, then the
+  // live log, ascending. A position below the earliest surviving seq simply
+  // starts at the earliest survivor: the gap was truncated away.
   const messagesAfter = (pos) => {
     const out = [];
     for (const m of baseMessages) {
@@ -261,13 +350,96 @@ export function createBus({ path: dir, fsync = false } = {}) {
         out.push({ seq: m.seq, id: m.id, record: structuredClone(m.record) });
       }
     }
+    for (const seg of segments) {
+      const { entries } = parseLog(readFileSync(path.join(dir, seg.name)));
+      for (const entry of entries) {
+        if (entry.t === 'm' && entry.seq > pos) {
+          out.push({ seq: entry.seq, id: entry.id, record: entry.record });
+        }
+      }
+    }
+    const maxSealed = maxSealedSeq();
     const { entries } = parseLog(readFileSync(logPath));
     for (const entry of entries) {
-      if (entry.t === 'm' && entry.seq > pos) {
+      if (entry.t === 'm' && entry.seq > pos && entry.seq > maxSealed) {
         out.push({ seq: entry.seq, id: entry.id, record: entry.record });
       }
     }
     return out;
+  };
+
+  // Seal the active log's messages with seq <= upTo into their own segment
+  // file and roll a fresh active log. The sealed segment holds message lines
+  // only; everything else (compact marker, positions, replay counters,
+  // checkpoints) is carried into the new active log, and the full dedup
+  // table is rewritten as carry entries — so physically deleting a segment
+  // later can never take positions, stats or dedup keys with it.
+  const rollSegment = (upTo) => {
+    const { committed } = scanLog(readFileSync(logPath));
+    const maxSealed = maxSealedSeq();
+    const live = committed.filter((e) => e.t === 'm' && e.seq > maxSealed);
+    const toSeal = live.filter((e) => e.seq <= upTo);
+    if (toSeal.length === 0) return;
+    const first = toSeal[0].seq;
+    const last = toSeal[toSeal.length - 1].seq;
+    const name = `bus.seg.${first}-${last}.jsonl`;
+    const segTmpPath = path.join(dir, `bus.seg.${first}-${last}.tmp`);
+
+    const segFd = openSync(segTmpPath, 'w');
+    try {
+      for (const m of toSeal) {
+        writeSync(segFd, Buffer.from(JSON.stringify(m) + '\n', 'utf8'));
+      }
+      fsyncSync(segFd);
+    } finally {
+      closeSync(segFd);
+    }
+
+    const lines = [];
+    for (const entry of committed) {
+      // Batch brackets are crash-recovery scaffolding for in-flight groups;
+      // committed ones mean nothing. Old dedup carries are superseded by the
+      // full table rewritten below.
+      if (entry.t === 'm' || entry.t === 'b' || entry.t === 'bk' || entry.t === 'd') continue;
+      lines.push(JSON.stringify(entry) + '\n');
+    }
+    for (const m of live) {
+      if (m.seq > upTo) lines.push(JSON.stringify(m) + '\n');
+    }
+    for (const [key, value] of dedup) {
+      lines.push(JSON.stringify({ t: 'd', k: key, id: value.id, seq: value.seq }) + '\n');
+    }
+    const tmpFd = openSync(logTmpPath, 'w');
+    try {
+      for (const line of lines) {
+        writeSync(tmpFd, Buffer.from(line, 'utf8'));
+      }
+      fsyncSync(tmpFd);
+    } finally {
+      closeSync(tmpFd);
+    }
+
+    // Land the sealed segment first, then replace the active log. A crash
+    // between the two renames leaves the messages in both files; recovery
+    // drops the active-log duplicates at or below the sealed horizon.
+    closeSync(fd);
+    try {
+      renameSync(segTmpPath, path.join(dir, name));
+      renameSync(logTmpPath, logPath);
+    } catch (err) {
+      // The old active log is still authoritative for whatever was not
+      // replaced. Reopen so close() works, but refuse further writes.
+      try {
+        fd = openSync(logPath, 'a');
+      } catch {
+        // Nothing usable: leave fd closed; every later op throws.
+      }
+      broken = true;
+      throw err;
+    }
+    fd = openSync(logPath, 'a');
+    segments.push({ name, first, last });
+    syncDir();
   };
 
   const bus = {
@@ -610,6 +782,46 @@ export function createBus({ path: dir, fsync = false } = {}) {
       return messagesAfter(pos);
     },
 
+    truncate(before) {
+      // Spec: a boundary that is not a non-negative integer is always a
+      // synchronous TypeError, even on a closed bus.
+      if (typeof before !== 'number' || !Number.isInteger(before) || before < 0) {
+        throw new TypeError('truncate: before must be a non-negative integer');
+      }
+      if (closed) {
+        return Promise.reject(new Error('bus is closed'));
+      }
+      return enqueue(() => {
+        if (closed || broken) {
+          throw new Error('bus is closed');
+        }
+        if (before === 0) {
+          return; // nothing can fall below a zero boundary: no-op
+        }
+        // Seal the boundary prefix of the active log into its own segment
+        // and roll a fresh active segment, so the deletion below is always
+        // whole-file — never half a segment.
+        rollSegment(before);
+        // A segment only disappears once every registered consumer's
+        // position has passed it. With no registered consumers there is
+        // nothing to protect. Segments not passed stay as-is, no error.
+        const minPos = positions.size === 0 ? Infinity : Math.min(...positions.values());
+        const victims = segments.filter((s) => s.last <= before && s.last <= minPos);
+        if (victims.length === 0) {
+          return; // nothing deletable: deletion is a no-op
+        }
+        // Durable checkpoint of the cumulative counters BEFORE any file goes
+        // away: after a crash the totals must not drop with the deleted
+        // segments. A crash before this line simply keeps the segments.
+        writeLine({ t: 'x', seq, bytes, published, replayed });
+        for (const victim of victims) {
+          rmSync(path.join(dir, victim.name), { force: true });
+        }
+        segments = segments.filter((s) => !victims.includes(s));
+        syncDir();
+      });
+    },
+
     compact() {
       if (closed) {
         return Promise.reject(new Error('bus is closed'));
@@ -618,10 +830,19 @@ export function createBus({ path: dir, fsync = false } = {}) {
         if (closed || broken) {
           throw new Error('bus is closed');
         }
-        const { entries } = parseLog(readFileSync(logPath));
         const messages = baseMessages.slice();
+        for (const seg of segments) {
+          const { entries } = parseLog(readFileSync(path.join(dir, seg.name)));
+          for (const entry of entries) {
+            if (entry.t === 'm') {
+              messages.push({ seq: entry.seq, id: entry.id, record: entry.record });
+            }
+          }
+        }
+        const maxSealed = maxSealedSeq();
+        const { entries } = parseLog(readFileSync(logPath));
         for (const entry of entries) {
-          if (entry.t === 'm') {
+          if (entry.t === 'm' && entry.seq > maxSealed) {
             messages.push({ seq: entry.seq, id: entry.id, record: entry.record });
           }
         }
@@ -654,19 +875,15 @@ export function createBus({ path: dir, fsync = false } = {}) {
         // fsync) leaving the old log in place is still safe: every byte of
         // it is covered by the new snapshot, so recovery folds it
         // harmlessly on reopen.
-        let dirSynced = false;
-        try {
-          const dirFd = openSync(dir, 'r');
-          try {
-            fsyncSync(dirFd);
-            dirSynced = true;
-          } finally {
-            closeSync(dirFd);
-          }
-        } catch {
-          // Directory sync unavailable: the replacement below remains
-          // crash-safe via the snapshot-covered old log.
+        syncDir();
+
+        // The folded segments are covered by the snapshot now; a crash
+        // before their removal is cleaned up on reopen (a segment at or
+        // below the snapshot horizon is a duplicate).
+        for (const seg of segments) {
+          rmSync(path.join(dir, seg.name), { force: true });
         }
+        segments = [];
 
         // Replacing the log must work on Windows: ftruncate() of an open
         // append handle does not shrink the file there. Close the handle,
@@ -686,18 +903,10 @@ export function createBus({ path: dir, fsync = false } = {}) {
           }
           renameSync(logTmpPath, logPath);
           replaced = true;
-          // Best-effort durability of the directory entry (may be
-          // unavailable on Windows / some filesystems); a crash here
-          // recovers to either the intact old log or the new one — both
-          // fully covered by the snapshot above.
-          if (dirSynced) {
-            const dirFd2 = openSync(dir, 'r');
-            try {
-              fsyncSync(dirFd2);
-            } finally {
-              closeSync(dirFd2);
-            }
-          }
+          // Best-effort durability of the directory entry. A failure here
+          // only weakens durability of the rename — the compaction itself
+          // already succeeded and must not be failed or break the bus.
+          syncDir();
           fd = openSync(logPath, 'a');
           fsyncSync(fd);
         } catch (err) {

@@ -1084,3 +1084,258 @@ test('publishBatch queued before close is rejected with no durable trace', async
   await reopened.close();
 });
 
+// ---- truncate --------------------------------------------------------------
+
+test('truncate: invalid boundary throws TypeError synchronously; zero is a no-op', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir });
+  for (const bad of [-1, 1.5, NaN, '1', {}, null, true, undefined, 2n, Infinity]) {
+    assert.throws(() => bus.truncate(bad), TypeError);
+  }
+  await bus.truncate(0); // zero boundary: no-op
+  for (let i = 1; i <= 3; i++) await bus.publish({ i });
+  await bus.truncate(0); // still a no-op with data present
+  assert.deepEqual((await bus.replay(0)).map((m) => m.seq), [1, 2, 3]);
+  assert.equal(bus.stats().published, 3);
+  await bus.close();
+});
+
+test('truncate: a segment disappears only once every consumer has passed it', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir });
+  for (let i = 1; i <= 10; i++) await bus.publish({ i });
+  bus.advance('slow', 4);
+  bus.advance('fast', 10);
+
+  // slow is still inside the boundary segment: nothing is deleted, no error.
+  await bus.truncate(6);
+  assert.deepEqual(
+    (await bus.replay(0)).map((m) => m.seq),
+    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+  );
+
+  // Once slow passes the sealed segment, the same boundary deletes it.
+  bus.advance('slow', 6);
+  await bus.truncate(6);
+  assert.deepEqual((await bus.replay(0)).map((m) => m.seq), [7, 8, 9, 10]);
+
+  // Repeating the same truncation is harmless.
+  await bus.truncate(6);
+  await bus.truncate(3);
+  assert.deepEqual((await bus.replay(0)).map((m) => m.seq), [7, 8, 9, 10]);
+  await bus.close();
+});
+
+test('truncate: replay of the surviving range is identical, deleted start served from earliest survivor', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir, fsync: true });
+  for (let i = 1; i <= 8; i++) await bus.publish({ i, t: '你好' });
+  const before = await bus.replay(0);
+  bus.advance('c', 8);
+  await bus.truncate(5);
+
+  const survivors = await bus.replay(0);
+  // Same entries down to the ids: seqs, bodies and order are untouched.
+  assert.deepEqual(survivors, before.slice(5));
+  // A start inside the deleted range begins at the earliest survivor.
+  assert.deepEqual(await bus.replay(3), survivors);
+  assert.deepEqual(await bus.replay(5), survivors);
+  assert.deepEqual((await bus.replay(7)).map((m) => m.seq), [7, 8]);
+  await bus.close();
+});
+
+test('truncate: boundary past the end is the end; everything gone replays empty, stats stay cumulative', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir });
+  for (let i = 1; i <= 5; i++) await bus.publish({ i });
+  bus.advance('c', 5);
+  const statsBefore = bus.stats();
+  await bus.truncate(999);
+  assert.deepEqual(await bus.replay(0), []);
+  assert.deepEqual(bus.read('c'), []);
+  // Truncation never shrinks the counters.
+  assert.deepEqual(bus.stats(), statsBefore);
+  // The sequence continues where it was.
+  const ack = await bus.publish({ i: 6 });
+  assert.equal(ack.seq, 6);
+  assert.deepEqual((await bus.replay(0)).map((m) => m.seq), [6]);
+  await bus.close();
+});
+
+test('truncate: with no registered consumers the boundary deletes immediately', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir });
+  for (let i = 1; i <= 4; i++) await bus.publish({ i });
+  await bus.truncate(2);
+  assert.deepEqual((await bus.replay(0)).map((m) => m.seq), [3, 4]);
+  await bus.close();
+});
+
+test('truncate: dedup acknowledgements survive truncation and restart, resend gets no new seq', async () => {
+  const dir = await freshDir();
+  let bus = createBus({ path: dir, fsync: true });
+  const first = await bus.publish({ order: 'A', dedupKey: 'k1' });
+  for (let i = 2; i <= 4; i++) await bus.publish({ i, dedupKey: `k${i}` });
+  bus.advance('c', 4);
+  await bus.truncate(4);
+  // The message is gone but its key still serves the first acknowledgement.
+  assert.deepEqual(await bus.publish({ order: 'A-again', dedupKey: 'k1' }), first);
+  assert.equal(bus.stats().seq, 4);
+  assert.equal(bus.stats().published, 4);
+  await bus.close();
+
+  bus = createBus({ path: dir });
+  assert.deepEqual(await bus.publish({ order: 'A-third', dedupKey: 'k1' }), first);
+  const k3 = await bus.publish({ x: 1, dedupKey: 'k3' });
+  assert.equal(k3.seq, 3);
+  assert.equal(bus.stats().published, 4);
+  assert.deepEqual(await bus.replay(0), []);
+  const ack = await bus.publish({ fresh: true });
+  assert.equal(ack.seq, 5);
+  await bus.close();
+});
+
+test('truncate: stats, positions and survivors are consistent after reopen', async () => {
+  const dir = await freshDir();
+  let bus = createBus({ path: dir, fsync: true });
+  for (let i = 1; i <= 6; i++) await bus.publish({ i, dedupKey: `d${i}` });
+  bus.advance('keeper', 6);
+  await bus.replay(0); // 6 replayed
+  await bus.truncate(4);
+  const before = bus.stats();
+  await bus.close();
+
+  bus = createBus({ path: dir });
+  assert.deepEqual(bus.stats(), before);
+  assert.equal(bus.register('keeper'), 6);
+  // A consumer first registered now starts below the earliest survivor.
+  assert.deepEqual(bus.read('late').map((m) => m.seq), [5, 6]);
+  assert.deepEqual((await bus.replay(0)).map((m) => m.seq), [5, 6]);
+  // A repeated truncation after reopen is a harmless no-op.
+  await bus.truncate(4);
+  assert.deepEqual((await bus.replay(0)).map((m) => m.seq), [5, 6]);
+  await bus.close();
+});
+
+test('truncate: a consumer behind the earliest survivor reads from the earliest survivor', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir });
+  for (let i = 1; i <= 6; i++) await bus.publish({ i });
+  bus.advance('c1', 6);
+  await bus.truncate(4);
+  // Brand-new consumer starts at 0, below the earliest surviving seq.
+  assert.deepEqual(bus.read('new').map((m) => m.seq), [5, 6]);
+  // No duplication and nothing skipped that still exists.
+  bus.advance('new', 5);
+  assert.deepEqual(bus.read('new').map((m) => m.seq), [6]);
+  await bus.close();
+});
+
+test('truncate: recovery cleans a stray segment tmp and a torn active tail', async () => {
+  const dir = await freshDir();
+  let bus = createBus({ path: dir });
+  for (let i = 1; i <= 6; i++) await bus.publish({ i });
+  bus.advance('c', 6);
+  await bus.truncate(4);
+  await bus.close();
+
+  await appendFile(path.join(dir, 'bus.jsonl'), '{"t":"m","seq":7,"id":"x",');
+  await appendFile(path.join(dir, 'bus.seg.7-9.tmp'), '{"t":"m","seq":7}');
+
+  bus = createBus({ path: dir });
+  assert.equal(bus.stats().seq, 6);
+  assert.equal(bus.stats().published, 6);
+  assert.deepEqual((await bus.replay(0)).map((m) => m.seq), [5, 6]);
+  const ack = await bus.publish({ i: 7 });
+  assert.equal(ack.seq, 7);
+  await bus.close();
+});
+
+test('truncate crash window: sealed segment landed but active log not yet replaced recovers without duplication', async () => {
+  const dir = await freshDir();
+  let bus = createBus({ path: dir });
+  for (let i = 1; i <= 5; i++) await bus.publish({ i, dedupKey: `k${i}` });
+  await bus.close();
+
+  // Simulate the crash between the two renames of a roll: the sealed
+  // segment exists AND the old active log still holds the same messages.
+  const raw = readFileSync(path.join(dir, 'bus.jsonl'), 'utf8');
+  writeFileSync(path.join(dir, 'bus.seg.1-5.jsonl'), raw);
+
+  bus = createBus({ path: dir });
+  assert.equal(bus.stats().published, 5);
+  assert.equal(bus.stats().seq, 5);
+  const got = await bus.replay(0);
+  assert.deepEqual(got.map((m) => m.seq), [1, 2, 3, 4, 5]);
+  // Dedup from the segment is effective exactly once.
+  const dup = await bus.publish({ i: 99, dedupKey: 'k2' });
+  assert.equal(dup.seq, 2);
+  const ack = await bus.publish({ i: 6 });
+  assert.equal(ack.seq, 6);
+  assert.equal(bus.stats().published, 6);
+  await bus.close();
+});
+
+test('truncate: compacted messages survive; post-compact segments truncate away', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir, fsync: true });
+  for (let i = 1; i <= 5; i++) await bus.publish({ i });
+  await bus.compact();
+  for (let i = 6; i <= 10; i++) await bus.publish({ i });
+  bus.advance('c', 10);
+  await bus.truncate(8);
+  // Snapshot messages 1..5 are folded state, not a segment; 6..8 are gone.
+  assert.deepEqual((await bus.replay(0)).map((m) => m.seq), [1, 2, 3, 4, 5, 9, 10]);
+  // Truncation and compaction never shrink the cumulative counters.
+  const statsBefore = bus.stats();
+  // Compacting again after a truncation stays consistent.
+  await bus.compact();
+  assert.deepEqual((await bus.replay(0)).map((m) => m.seq), [1, 2, 3, 4, 5, 9, 10]);
+  assert.equal(bus.stats().seq, statsBefore.seq);
+  assert.equal(bus.stats().bytes, statsBefore.bytes);
+  assert.equal(bus.stats().published, statsBefore.published);
+  await bus.close();
+});
+
+test('truncate: concurrent with publish/batch/replay/positions serializes cleanly', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir });
+  const jobs = [];
+  for (let i = 1; i <= 30; i++) {
+    jobs.push(bus.publish({ i, dedupKey: `k${i % 7}` }));
+    if (i % 4 === 0) jobs.push(bus.truncate(i));
+    if (i % 5 === 0) bus.advance('c', i);
+    if (i % 6 === 0) jobs.push(bus.replay(0));
+  }
+  jobs.push(bus.publishBatch([{ b: 1 }, { b: 2, dedupKey: 'kb' }]));
+  await Promise.all(jobs);
+
+  // 7 distinct keys among the singles, plus 2 effective batch messages.
+  assert.equal(bus.stats().published, 9);
+  assert.equal(bus.stats().seq, 9);
+  // c is already at 30, past every message: the boundary deletes everything.
+  await bus.truncate(999);
+  assert.deepEqual(await bus.replay(0), []);
+  // Dedup still resolves keys whose messages were truncated away.
+  const dup = await bus.publish({ x: 1, dedupKey: 'k3' });
+  assert.equal(dup.seq, 3);
+  const ack = await bus.publish({ fresh: true });
+  assert.equal(ack.seq, 10);
+  await bus.close();
+
+  const reopened = createBus({ path: dir });
+  assert.equal(reopened.stats().published, 10);
+  assert.deepEqual(await reopened.publish({ x: 2, dedupKey: 'k3' }), dup);
+  await reopened.close();
+});
+
+test('truncate: after close rejects Error; bad boundary is still a synchronous TypeError', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir });
+  await bus.publish({ a: 1 });
+  await bus.close();
+  await assert.rejects(bus.truncate(1), Error);
+  assert.throws(() => bus.truncate(-1), TypeError);
+  assert.throws(() => bus.truncate('x'), TypeError);
+  assert.equal(bus.stats().published, 1);
+});
