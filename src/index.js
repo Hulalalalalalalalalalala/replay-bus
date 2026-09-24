@@ -80,9 +80,18 @@ function parseLog(raw) {
   return { entries, durable: start };
 }
 
-export function createBus({ path: dir, fsync = false } = {}) {
+export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
   if (typeof dir !== 'string' || dir.length === 0) {
     throw new TypeError('createBus: "path" must be a non-empty string');
+  }
+  // Omitted (undefined) means unlimited; any given value must be a positive
+  // integer — zero, negatives, fractions and non-numbers are TypeErrors.
+  let quota;
+  if (maxBytes !== undefined) {
+    if (typeof maxBytes !== 'number' || !Number.isInteger(maxBytes) || maxBytes <= 0) {
+      throw new TypeError('createBus: "maxBytes" must be a positive integer');
+    }
+    quota = maxBytes;
   }
 
   const logPath = path.join(dir, LOG_NAME);
@@ -114,6 +123,11 @@ export function createBus({ path: dir, fsync = false } = {}) {
   let foldedSeq = 0;
   // Index handed to the next finalized segment; never reused within a run.
   let nextSegmentIndex = 1;
+  // Business bytes of the messages still retained (seq > horizon, i.e.
+  // snapshot survivors plus live-log messages). Unlike the cumulative
+  // `bytes` stat this shrinks when retention truncation frees messages;
+  // compaction only reshapes the log and never changes it.
+  let usageBytes = 0;
 
   // ---- synchronous recovery so stats() is correct the moment createBus returns
   mkdirSync(dir, { recursive: true });
@@ -293,6 +307,27 @@ export function createBus({ path: dir, fsync = false } = {}) {
     }
   }
 
+  // Recompute retained bytes from the surviving messages after recovery:
+  // snapshot survivors plus messages in finalized segments and the active
+  // log above both the horizon and the folded floor. Torn tails and
+  // uncommitted batches were severed above, so their bytes never count —
+  // usage always matches the messages actually alive.
+  for (const m of baseMessages) {
+    if (m.seq > horizon) usageBytes += Buffer.byteLength(JSON.stringify(m.record), 'utf8');
+  }
+  {
+    const logFloor = Math.max(horizon, foldedSeq);
+    const sumFile = (filePath) => {
+      if (!existsSync(filePath)) return;
+      const { entries } = parseLog(readFileSync(filePath));
+      for (const entry of entries) {
+        if (entry.t === 'm' && entry.seq > logFloor) usageBytes += entry.bytes;
+      }
+    };
+    for (const seg of listSegments()) sumFile(seg.path);
+    sumFile(logPath);
+  }
+
   // Reassigned by compact()/truncate() when they swap the active log.
   let fd = openSync(logPath, 'a');
 
@@ -425,6 +460,13 @@ export function createBus({ path: dir, fsync = false } = {}) {
         if (closed || broken) {
           throw new Error('bus is closed');
         }
+        // Quota is checked inside the serial job, so a truncate queued
+        // earlier releases its bytes before this publish is judged. An
+        // exact fit succeeds; one byte over (or a single oversized record)
+        // rejects before anything is written — state stays untouched.
+        if (quota !== undefined && usageBytes + size > quota) {
+          throw new RangeError('publish: retained bytes would exceed maxBytes');
+        }
         const mySeq = seq + 1;
         const id = randomUUID();
         const entry = { t: 'm', seq: mySeq, id, bytes: size, record };
@@ -439,6 +481,7 @@ export function createBus({ path: dir, fsync = false } = {}) {
         }
         seq = mySeq;
         bytes += size;
+        usageBytes += size;
         published += 1;
         if (dedupKey !== undefined) {
           dedup.set(dedupKey, { id, seq: mySeq });
@@ -536,6 +579,7 @@ export function createBus({ path: dir, fsync = false } = {}) {
         // their committed dedup keys.
         const gid = randomUUID();
         let nextSeq = seq;
+        let effectiveBytes = 0;
         const owned = new Map(); // key -> first acknowledgement within group
         const keyAcks = new Map(); // every dedup key's resolved acknowledgement
         const planned = prepared.map((item) => {
@@ -564,8 +608,17 @@ export function createBus({ path: dir, fsync = false } = {}) {
           let line = `{"t":"m","seq":${nextSeq},"id":${JSON.stringify(id)},"bytes":${item.size}`;
           if (key !== undefined) line += `,"d":${JSON.stringify(key)}`;
           line += `,"record":${item.recordJson}}\n`;
+          effectiveBytes += item.size;
           return { effective: { ack, line, size: item.size, key } };
         });
+
+        // Shape validation happened at call time; quota is judged for the
+        // whole group here, against committed state and counting only the
+        // first occurrence of each key. One byte over rejects the entire
+        // group before the bracket is opened — no seq, stat or file change.
+        if (quota !== undefined && usageBytes + effectiveBytes > quota) {
+          throw new RangeError('publishBatch: retained bytes would exceed maxBytes');
+        }
 
         // One begin-bracket, the group's new messages, one commit-bracket.
         // Recovery applies the bracketed entries only when the commit is
@@ -613,6 +666,7 @@ export function createBus({ path: dir, fsync = false } = {}) {
           const { ack, size, key } = part.effective;
           seq = ack.seq;
           bytes += size;
+          usageBytes += size;
           published += 1;
           if (key !== undefined) dedup.set(key, { id: ack.id, seq: ack.seq });
         }
@@ -854,6 +908,7 @@ export function createBus({ path: dir, fsync = false } = {}) {
         if (closed || broken) {
           throw new Error('bus is closed');
         }
+        const oldHorizon = horizon;
 
         // Truncation deals in whole segments only: seal the active segment
         // so its contents become eligible, and roll a fresh one. The rename
@@ -886,6 +941,20 @@ export function createBus({ path: dir, fsync = false } = {}) {
         // prefix (its position/stat lines are checkpointed below).
         const doomed = [];
         let newHorizon = horizon;
+        let freedBytes = 0;
+        const segmentBytes = (filePath) => {
+          const { entries } = parseLog(readFileSync(filePath));
+          let n = 0;
+          // Exactly the bytes this run still counts as retained: above both
+          // the folded floor and the current horizon. This keeps a stale
+          // segment (its earlier unlink failed and it is swept again) from
+          // freeing the same bytes twice.
+          const floor = Math.max(horizon, foldedSeq);
+          for (const entry of entries) {
+            if (entry.t === 'm' && entry.seq > floor) n += entry.bytes;
+          }
+          return n;
+        };
         for (const seg of listSegments()) {
           const max = segmentMaxSeq(seg.path);
           if (max !== null) {
@@ -900,6 +969,7 @@ export function createBus({ path: dir, fsync = false } = {}) {
             }
             if (held) break;
             if (max > newHorizon) newHorizon = max;
+            freedBytes += segmentBytes(seg.path);
           }
           doomed.push(seg);
         }
@@ -970,11 +1040,29 @@ export function createBus({ path: dir, fsync = false } = {}) {
           }
         }
         horizon = newHorizon;
+        // The discarded segments' business bytes are genuinely gone now
+        // (marker durable, unlinks attempted); release their quota. The
+        // horizon can also run past messages folded into the snapshot:
+        // release their bytes too, so usage matches the surviving set.
+        // The cumulative stats bytes/published deliberately stay put.
+        usageBytes -= freedBytes;
+        for (const m of baseMessages) {
+          if (m.seq > oldHorizon && m.seq <= newHorizon) {
+            usageBytes -= Buffer.byteLength(JSON.stringify(m.record), 'utf8');
+          }
+        }
       });
     },
 
     stats() {
       return { seq, bytes, published, replayed };
+    },
+
+    // Business bytes of the messages still retained (not yet discarded by
+    // retention truncation). Compaction does not change it; an empty bus is
+    // zero. Readable after close, like stats().
+    usage() {
+      return usageBytes;
     },
 
     close() {

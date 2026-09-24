@@ -1528,3 +1528,341 @@ test('truncate: queued before close is rejected and changes nothing', async () =
   await reopened.close();
 });
 
+// ---- byte quota (maxBytes / usage) ------------------------------------------
+
+test('maxBytes validation: omitted is unlimited; non-positive-integer throws TypeError synchronously', () => {
+  const dirsLocal = [];
+  const make = (maxBytes) => {
+    const dir = `/tmp/replay-bus-quota-check-${Math.random().toString(36).slice(2)}`;
+    dirsLocal.push(dir);
+    return createBus(maxBytes === undefined ? { path: dir } : { path: dir, maxBytes });
+  };
+  for (const bad of [0, -1, -100, 1.5, 0.1, NaN, Infinity, '5', '', null, true, false, {}, []]) {
+    assert.throws(() => make(bad), TypeError);
+  }
+  // Omitted or an actual positive integer are fine.
+  const unbounded = make(undefined);
+  assert.equal(unbounded.usage(), 0);
+  const one = make(1);
+  assert.equal(one.usage(), 0);
+  return Promise.all([unbounded.close(), one.close()]).then(() =>
+    Promise.all(dirsLocal.map((d) => rm(d, { recursive: true, force: true }))),
+  );
+});
+
+test('usage: zero on an empty bus and equal to stats bytes while nothing is truncated', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir, maxBytes: 100000 });
+  assert.equal(bus.usage(), 0);
+  await bus.publish({ a: 1 });
+  await bus.publish({ msg: '你好' });
+  assert.equal(bus.usage(), bus.stats().bytes);
+  // Snapshot changes shape, not the retained byte count.
+  await bus.compact();
+  assert.equal(bus.usage(), bus.stats().bytes);
+  await bus.close();
+});
+
+test('quota: an exact fit succeeds; one byte over rejects RangeError with state untouched', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir });
+  const size = Buffer.byteLength(JSON.stringify({ a: 1 }), 'utf8');
+  await bus.close();
+
+  const capped = createBus({ path: dir, maxBytes: size });
+  const ack = await capped.publish({ a: 1 });
+  assert.equal(ack.seq, 1);
+  assert.equal(capped.usage(), size);
+
+  // Even a tiny record cannot fit once the quota is full.
+  await assert.rejects(capped.publish({ a: 2 }), RangeError);
+  // Nothing moved: seq, cumulative stats and usage all stay at the fit.
+  assert.equal(capped.stats().seq, 1);
+  assert.equal(capped.stats().published, 1);
+  assert.equal(capped.stats().bytes, size);
+  assert.equal(capped.usage(), size);
+  // The rejected record is not visible.
+  assert.deepEqual((await capped.replay(0)).map((m) => m.seq), [1]);
+  await capped.close();
+});
+
+test('quota: a single record larger than maxBytes can never be published', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir, maxBytes: 5 });
+  assert.equal(bus.usage(), 0);
+  await assert.rejects(bus.publish({ definitely: 'too big' }), RangeError);
+  assert.equal(bus.usage(), 0);
+  assert.equal(bus.stats().seq, 0);
+  // The rejection consumed no headroom: a small record still lands.
+  const tiny = {};
+  await assert.rejects(bus.publish({ alsoTooBig: 'yes' }), RangeError);
+  const ack = await bus.publish(tiny);
+  assert.equal(ack.seq, 1);
+  assert.equal(bus.usage(), Buffer.byteLength(JSON.stringify(tiny), 'utf8'));
+  await bus.close();
+});
+
+test('quota: resending an existing dedupKey while full succeeds, reuses the ack, uses no quota', async () => {
+  const dir = await freshDir();
+  const record = { order: 'A', dedupKey: 'k1' };
+  const size = Buffer.byteLength(JSON.stringify(record), 'utf8');
+  const bus = createBus({ path: dir, maxBytes: size });
+  const first = await bus.publish(record);
+  assert.equal(bus.usage(), size);
+  // Full: a brand-new message is refused.
+  await assert.rejects(bus.publish({ fresh: true }), RangeError);
+  // But the resend rides the first acknowledgement and allocates nothing.
+  const again = await bus.publish({ order: 'totally-different-body', dedupKey: 'k1' });
+  assert.deepEqual(again, first);
+  assert.equal(bus.usage(), size);
+  assert.equal(bus.stats().published, 1);
+  await bus.close();
+});
+
+test('quota: read paths are unaffected when the bus is full', async () => {
+  const dir = await freshDir();
+  const r1 = { v: 1 };
+  const size = Buffer.byteLength(JSON.stringify(r1), 'utf8');
+  const bus = createBus({ path: dir, maxBytes: size });
+  await bus.publish(r1);
+  await assert.rejects(bus.publish({ v: 2 }), RangeError);
+  // replay / register / advance / read / stats all behave normally.
+  assert.deepEqual((await bus.replay(0)).map((m) => m.seq), [1]);
+  assert.equal(bus.register('c'), 0);
+  bus.advance('c', 1);
+  assert.deepEqual(bus.read('c'), []);
+  assert.equal(bus.stats().seq, 1);
+  await bus.close();
+});
+
+test('quota batch: shape validation first, then whole-group occupancy; an all-dup group always fits', async () => {
+  const dir = await freshDir();
+  const a = { v: 1, dedupKey: 'hist' };
+  const sizeA = Buffer.byteLength(JSON.stringify(a), 'utf8');
+  const bus = createBus({ path: dir, maxBytes: sizeA });
+  const first = await bus.publish(a);
+  assert.equal(bus.usage(), sizeA);
+
+  // A group carrying one new byte too many is rejected wholesale.
+  await assert.rejects(
+    bus.publishBatch([{ v: 2, dedupKey: 'g1' }, { v: 3, dedupKey: 'g2' }]),
+    RangeError,
+  );
+  assert.equal(bus.usage(), sizeA);
+  assert.equal(bus.stats().seq, 1);
+  assert.deepEqual((await bus.replay(0)).map((m) => m.seq), [1]);
+
+  // A group whose records all reuse an existing key needs no room.
+  const acks = await bus.publishBatch([
+    { v: 9, dedupKey: 'hist' },
+    { v: 8, dedupKey: 'hist' },
+  ]);
+  assert.deepEqual(acks[0], first);
+  assert.deepEqual(acks[1], first);
+  assert.equal(bus.usage(), sizeA);
+
+  // A bad shape still beats the quota check: TypeError, not RangeError.
+  await assert.rejects(bus.publishBatch([null, { v: 2 }]), TypeError);
+  await bus.close();
+});
+
+test('quota batch: in-group duplicate keys are charged once; exact group fit lands', async () => {
+  const dir = await freshDir();
+  const r1 = { order: 'A', dedupKey: 'k1' };
+  const r2 = { order: 'B' };
+  const need =
+    Buffer.byteLength(JSON.stringify(r1), 'utf8') +
+    Buffer.byteLength(JSON.stringify(r2), 'utf8');
+  const bus = createBus({ path: dir, maxBytes: need });
+  const acks = await bus.publishBatch([
+    r1,
+    r2,
+    { order: 'A2', dedupKey: 'k1' }, // duplicate: only the first occurrence is charged
+  ]);
+  assert.deepEqual(acks.map((x) => x.seq), [1, 2, 1]);
+  assert.equal(bus.usage(), need);
+  // Exactly full: the next group refuses without a trace.
+  const before = bus.stats();
+  await assert.rejects(bus.publishBatch([{ z: 1 }]), RangeError);
+  assert.deepEqual(bus.stats(), before);
+  assert.equal(bus.usage(), need);
+  await bus.close();
+});
+
+test('quota batch: oversized group leaves no durable trace and later messages still fit', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir, maxBytes: 40 });
+  await assert.rejects(
+    bus.publishBatch([{ pad: 'x'.repeat(40) }, { pad: 'y'.repeat(40) }]),
+    RangeError,
+  );
+  assert.equal(bus.usage(), 0);
+  assert.equal(bus.stats().seq, 0);
+  await bus.close();
+
+  const reopened = createBus({ path: dir, maxBytes: 40 });
+  assert.equal(reopened.usage(), 0);
+  assert.deepEqual(await reopened.replay(0), []);
+  await reopened.close();
+});
+
+test('quota: truncation frees bytes by the consumer-position rules and publishing resumes', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir });
+  const sizes = [];
+  for (let i = 1; i <= 5; i++) {
+    const r = { i, pad: '你好'.repeat(i) };
+    sizes.push(Buffer.byteLength(JSON.stringify(r), 'utf8'));
+    await bus.publish(r);
+  }
+  const total = sizes.reduce((n, s) => n + s, 0);
+  await bus.close();
+
+  const capped = createBus({ path: dir, maxBytes: total });
+  assert.equal(capped.usage(), total);
+  await assert.rejects(capped.publish({ i: 6 }), RangeError);
+
+  // A slow consumer at position 0 holds the single segment: nothing freed.
+  capped.register('slow');
+  await capped.truncate(5);
+  assert.equal(capped.usage(), total);
+  await assert.rejects(capped.publish({ i: 6 }), RangeError);
+
+  // Once every consumer passes the segment, truncation discards and frees it.
+  capped.advance('slow', 5);
+  await capped.truncate(5);
+  assert.equal(capped.usage(), 0);
+  assert.deepEqual(await capped.replay(0), []);
+  // Cumulative stats never shrink.
+  assert.equal(capped.stats().bytes, total);
+
+  const ack = await capped.publish({ i: 6 });
+  assert.equal(ack.seq, 6);
+  assert.ok(capped.usage() > 0 && capped.usage() <= total);
+  await capped.close();
+});
+
+test('quota: compaction does not release any quota', async () => {
+  const dir = await freshDir();
+  const records = [{ a: 1 }, { b: '你好'.repeat(3) }, { c: [1, 2, 3] }];
+  const total = records.reduce((n, r) => n + Buffer.byteLength(JSON.stringify(r), 'utf8'), 0);
+  const bus = createBus({ path: dir, maxBytes: total });
+  for (const r of records) await bus.publish(r);
+  assert.equal(bus.usage(), total);
+  await bus.compact();
+  assert.equal(bus.usage(), total);
+  await assert.rejects(bus.publish({ d: 1 }), RangeError);
+  // Repeated compaction changes nothing about the quota.
+  await bus.compact();
+  assert.equal(bus.usage(), total);
+  await bus.close();
+});
+
+test('quota: checks run in serial order — a queued truncate unblocks a queued publish', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir });
+  const r = { fill: 'xy'.repeat(8) };
+  const size = Buffer.byteLength(JSON.stringify(r), 'utf8');
+  await bus.publish(r);
+  await bus.close();
+
+  const capped = createBus({ path: dir, maxBytes: size });
+  assert.equal(capped.usage(), size);
+  // Both calls land before either job runs; invocation order decides.
+  const truncateP = capped.truncate(1);
+  const publishP = capped.publish({ after: true });
+  await truncateP;
+  const ack = await publishP;
+  assert.equal(ack.seq, 2);
+  assert.equal(capped.usage(), Buffer.byteLength(JSON.stringify({ after: true }), 'utf8'));
+  await capped.close();
+});
+
+test('quota: usage and rejections are stable across reopen; a half-written batch holds no bytes', async () => {
+  const dir = await freshDir();
+  const r1 = { a: 1 };
+  const r2 = { b: '你好' };
+  const need =
+    Buffer.byteLength(JSON.stringify(r1), 'utf8') +
+    Buffer.byteLength(JSON.stringify(r2), 'utf8');
+  let bus = createBus({ path: dir, fsync: true, maxBytes: need });
+  await bus.publish(r1);
+  await bus.publish(r2);
+  assert.equal(bus.usage(), need);
+  await assert.rejects(bus.publish({ c: 3 }), RangeError);
+  await bus.close();
+
+  // Reopen with the same cap: retained occupancy comes back exactly.
+  bus = createBus({ path: dir, maxBytes: need });
+  assert.equal(bus.usage(), need);
+  assert.equal(bus.stats().bytes, need);
+  await assert.rejects(bus.publish({ c: 3 }), RangeError);
+  await bus.close();
+
+  // Crash mid group: the uncommitted bracket must neither be alive nor hold
+  // quota after reopen, so a record of the freed size fits.
+  await appendFile(path.join(dir, 'bus.jsonl'), JSON.stringify({ t: 'b', id: 'dead' }) + '\n');
+  await appendFile(
+    path.join(dir, 'bus.jsonl'),
+    JSON.stringify({ t: 'm', seq: 3, id: 'z', bytes: 99, record: { c: 3 } }) + '\n',
+  );
+  bus = createBus({ path: dir, maxBytes: need });
+  assert.equal(bus.usage(), need);
+  assert.equal(bus.stats().seq, 2);
+  await assert.rejects(bus.publish({ definitelyTooLarge: true }), RangeError);
+  await bus.close();
+});
+
+test('quota: truncation after compaction also releases the snapshot-folded bytes at runtime', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir, fsync: true });
+  for (let i = 1; i <= 5; i++) await bus.publish({ i, pad: '你好'.repeat(i) });
+  const firstFive = bus.usage();
+  await bus.compact();
+  assert.equal(bus.usage(), firstFive); // compaction releases nothing
+  for (let i = 6; i <= 8; i++) await bus.publish({ i });
+  const withEight = bus.usage();
+  // No consumers: the post-compaction segment (6..8) is deletable; its
+  // horizon runs past the folded messages 1..5 as well.
+  await bus.truncate(8);
+  assert.deepEqual(await bus.replay(0), []);
+  assert.equal(bus.usage(), 0);
+  assert.equal(withEight > firstFive, true);
+  // Cumulative stats are untouched by retention.
+  assert.equal(bus.stats().bytes, withEight);
+
+  // Headroom is back without a reopen; publishing resumes immediately.
+  const ack = await bus.publish({ fresh: 1 });
+  assert.equal(ack.seq, 9);
+  const freshSize = Buffer.byteLength(JSON.stringify({ fresh: 1 }), 'utf8');
+  assert.equal(bus.usage(), freshSize);
+
+  // And the same accounting survives restart.
+  await bus.close();
+  const reopened = createBus({ path: dir, maxBytes: freshSize });
+  assert.equal(reopened.usage(), freshSize);
+  await assert.rejects(reopened.publish({ too: 'much' }), RangeError);
+  await reopened.close();
+});
+
+test('quota: usage() stays readable after close; close is still idempotent', async () => {
+  const dir = await freshDir();
+  const r = { a: 1 };
+  const size = Buffer.byteLength(JSON.stringify(r), 'utf8');
+  const bus = createBus({ path: dir, maxBytes: size * 2 });
+  await bus.publish(r);
+  await bus.close();
+  await bus.close();
+  assert.equal(bus.usage(), size);
+  await assert.rejects(bus.publish({ a: 2 }), Error);
+});
+
+test('quota: without maxBytes the bus stays unlimited regardless of occupancy', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir });
+  for (let i = 0; i < 50; i++) await bus.publish({ pad: '你好'.repeat(20) });
+  assert.ok(bus.usage() > 0);
+  await bus.publish({ oneMore: true });
+  await bus.close();
+});
+
