@@ -80,10 +80,20 @@ function parseLog(raw) {
   return { entries, durable: start };
 }
 
-export function createBus({ path: dir, fsync = false } = {}) {
+export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
   if (typeof dir !== 'string' || dir.length === 0) {
     throw new TypeError('createBus: "path" must be a non-empty string');
   }
+  // Omitted (or explicitly undefined): unlimited. When given, it must be a
+  // positive integer — zero, negatives, fractions, NaN/Infinity and
+  // non-numbers are all a synchronous TypeError.
+  if (
+    maxBytes !== undefined &&
+    (typeof maxBytes !== 'number' || !Number.isInteger(maxBytes) || maxBytes <= 0)
+  ) {
+    throw new TypeError('createBus: "maxBytes" must be a positive integer');
+  }
+  const quota = maxBytes === undefined ? Infinity : maxBytes;
 
   const logPath = path.join(dir, LOG_NAME);
   const logTmpPath = path.join(dir, LOG_TMP_NAME);
@@ -373,6 +383,31 @@ export function createBus({ path: dir, fsync = false } = {}) {
     return out;
   };
 
+  // Business bytes of the messages still retained (seq > horizon): the exact
+  // set replay/read serve, counted with the same per-record byte size stats
+  // uses. Derived from the snapshot plus surviving log segments rather than
+  // kept as a separate counter, so a torn tail, an uncommitted batch or a
+  // mid-write crash can never leave the quota accounting out of step with
+  // which messages are actually alive. Compaction reshapes storage without
+  // changing the answer; truncation lowers it.
+  const liveMessageBytes = () => {
+    let total = 0;
+    for (const m of baseMessages) {
+      if (m.seq > horizon) total += m.bytes ?? Buffer.byteLength(JSON.stringify(m.record), 'utf8');
+    }
+    // Log entries at/below foldedSeq are covered by the snapshot.
+    const logFloor = Math.max(horizon, foldedSeq);
+    const collect = (filePath) => {
+      const { entries } = parseLog(readFileSync(filePath));
+      for (const entry of entries) {
+        if (entry.t === 'm' && entry.seq > logFloor) total += entry.bytes;
+      }
+    };
+    for (const seg of listSegments()) collect(seg.path);
+    collect(logPath);
+    return total;
+  };
+
   const bus = {
     publish(record) {
       if (closed) {
@@ -424,6 +459,13 @@ export function createBus({ path: dir, fsync = false } = {}) {
       enqueue(() => {
         if (closed || broken) {
           throw new Error('bus is closed');
+        }
+        // Quota is decided inside the serial job, after every earlier
+        // publish/truncate has committed: exactly filling the limit is
+        // allowed, one byte over is not, and nothing is written on refusal.
+        // A resend never reaches here (it shares the first acknowledgement).
+        if (liveMessageBytes() + size > quota) {
+          throw new RangeError('publish: retained bytes would exceed maxBytes');
         }
         const mySeq = seq + 1;
         const id = randomUUID();
@@ -566,6 +608,19 @@ export function createBus({ path: dir, fsync = false } = {}) {
           line += `,"record":${item.recordJson}}\n`;
           return { effective: { ack, line, size: item.size, key } };
         });
+
+        // Shape validation ran up front; only now, inside the serial job and
+        // against durable state, is the group's effective footprint known.
+        // Historical and in-group duplicate keys added no effective record,
+        // so they add no bytes. The whole group is refused (before any write)
+        // if its effective records would push retention past the limit.
+        let groupBytes = 0;
+        for (const part of planned) {
+          if (part.effective) groupBytes += part.effective.size;
+        }
+        if (liveMessageBytes() + groupBytes > quota) {
+          throw new RangeError('publishBatch: retained bytes would exceed maxBytes');
+        }
 
         // One begin-bracket, the group's new messages, one commit-bracket.
         // Recovery applies the bracketed entries only when the commit is
@@ -732,7 +787,7 @@ export function createBus({ path: dir, fsync = false } = {}) {
           const { entries } = parseLog(readFileSync(filePath));
           for (const entry of entries) {
             if (entry.t === 'm' && entry.seq > logFloor) {
-              messages.push({ seq: entry.seq, id: entry.id, record: entry.record });
+              messages.push({ seq: entry.seq, id: entry.id, bytes: entry.bytes, record: entry.record });
             }
           }
         };
@@ -975,6 +1030,13 @@ export function createBus({ path: dir, fsync = false } = {}) {
 
     stats() {
       return { seq, bytes, published, replayed };
+    },
+
+    // Retained business bytes: zero on an empty bus, unchanged by a
+    // snapshot reshape, released as truncation discards messages. Readable
+    // after close like stats(); never throws.
+    usage() {
+      return liveMessageBytes();
     },
 
     close() {
