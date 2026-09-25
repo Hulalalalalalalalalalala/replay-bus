@@ -78,6 +78,9 @@ const RENEW_MS = envRenew > 0 ? envRenew : Math.min(250, Math.floor(LEASE_MS / 1
 //  - BUS_DRAIN_DELAY_MS: hold the mutex at the drain entrance (heartbeat
 //    kept fresh) so concurrently staged requests deterministically join
 //    the same commit group.
+//  - BUS_DRAIN_MERGE_MS: override the post-gather coalescing quiet
+//    interval (0 disables), so tests can make real-concurrency merging
+//    deterministic without freezing the drain.
 //  - BUS_DRAIN_STALL_MS: after the first flush chunk block WITHOUT
 //    refreshing the heartbeat, reproducing a holder seized mid group.
 //  - BUS_FLUSH_FAIL_AT: fail the flush once this many group bytes are down.
@@ -88,8 +91,17 @@ const seamNumber = (name) => Number(process.env[name]) || 0;
 const LOCK_STALE_MS = LEASE_MS;
 const LOCK_SPIN_MS = 5;
 const LOCK_WAIT_MS = 15000;
-// Best-effort stats()/usage() scan: never block long behind a write job.
+// Best-effort lock wait for the open-time prime and the close-time lease
+// release: neither may block long behind a write job.
 const VIEW_WAIT_MS = 100;
+// Drain coalescing window: while several live sessions share the lease, a
+// drain re-gathers the staging area until this quiet interval passes with
+// no new arrivals (bounded at 4x, so a continuous staging rate can never
+// hold the mutex). Requests staged while this process waited for the lock
+// — or a heartbeat after its first gather — then land in the SAME commit
+// group instead of needing a second lock round. Single-holder leases skip
+// the wait entirely. BUS_DRAIN_MERGE_MS overrides the quiet interval.
+const DRAIN_MERGE_MS = 10;
 
 // The log is a chain of segment files: the active `bus.jsonl` plus finalized
 // `bus.<index>.jsonl` segments. Index order is oldest first; an index is
@@ -213,14 +225,18 @@ const listSegments = (dir) => {
  * Extract the committed, non-stale entries from a raw log buffer, using the
  * same bracket/fence rules as scanDirectory's recovery walk but without
  * touching any state: the incremental tail reader applies the result onto
- * the cached merged view. Returns { units, watermark, closed, structural }:
- * `closed` is false when the buffer ends inside an uncommitted batch
- * bracket (a crash mid group), in which case the caller heals with a full
- * scan; `structural` is set when a truncate/compact marker or a fence was
- * seen, which also forces a full rescan.
+ * the cached merged view. Returns { units, spans, watermark, closed,
+ * structural, torn }: `spans` is aligned with `units` and carries each
+ * unit's source line as { off, len } relative to the start of `raw`, so
+ * the lock-free read view can locate a committed message's bytes without
+ * holding its payload. `closed` is false when the buffer ends inside an
+ * uncommitted batch bracket (a crash mid group), in which case the caller
+ * heals with a full scan; `structural` is set when a truncate/compact
+ * marker or a fence was seen, which also forces a full rescan.
  */
 function committedUnits(raw, startWatermark) {
   const units = [];
+  const spans = [];
   let watermark = startWatermark;
   let lineStart = 0;
   let group = null;
@@ -230,6 +246,7 @@ function committedUnits(raw, startWatermark) {
   for (let i = 0; i < raw.length; i++) {
     if (raw[i] !== 0x0a) continue;
     const entry = i > lineStart ? JSON.parse(raw.toString('utf8', lineStart, i)) : null;
+    const span = { off: lineStart, len: i - lineStart };
     if (entry && entry.t === 'f') {
       if (typeof entry.g === 'number' && entry.g > watermark) watermark = entry.g;
       structural = true;
@@ -238,12 +255,15 @@ function committedUnits(raw, startWatermark) {
       if (stale(entry)) {
         // A preempted holder's bytes never close or enter the group.
       } else if (entry && entry.t === 'bk' && entry.id === group.id) {
-        for (const member of group.entries) units.push(member);
+        for (const member of group.entries) {
+          units.push(member.entry);
+          spans.push(member.span);
+        }
         group = null;
       } else if (entry && entry.t === 'b') {
         group = { id: entry.id, entries: [] };
       } else if (entry) {
-        group.entries.push(entry);
+        group.entries.push({ entry, span });
       }
     } else if (entry && entry.t === 'b') {
       if (!stale(entry)) group = { id: entry.id, entries: [] };
@@ -252,6 +272,7 @@ function committedUnits(raw, startWatermark) {
         structural = true;
       } else if (!stale(entry)) {
         units.push(entry);
+        spans.push(span);
       }
     }
     lineStart = i + 1;
@@ -260,7 +281,7 @@ function committedUnits(raw, startWatermark) {
   // line). They are never parsed; the caller treats them like an open
   // bracket — heal before appending.
   const torn = lineStart < raw.length;
-  return { units, watermark, closed: group === null, structural, torn };
+  return { units, spans, watermark, closed: group === null, structural, torn };
 }
 
 
@@ -464,6 +485,11 @@ function scanDirectory(dir) {
   const tails = [];
   const removable = [];
   let reset = false;
+  // Byte length of the active log exactly as this scan processed it. The
+  // lock-free read view re-reads precisely this prefix when it builds its
+  // locator index, so its message positions and the scan's counters always
+  // describe the same committed prefix.
+  let logBytes = 0;
 
   // Fences raise the epoch watermark in log order. Walk every file first so
   // each file is scanned with the watermark as of its own position and the
@@ -586,6 +612,7 @@ function scanDirectory(dir) {
     // remembered for physical severing rather than truncated during read.
     for (let i = Math.max(startAt, 0); i < ordered.length; i++) {
       const raw = readFileSync(ordered[i]);
+      if (ordered[i] === logPath) logBytes = raw.length;
       const committedEnd = recoverLog(raw, watermarkAtStart[i]);
       if (committedEnd < raw.length) tails.push({ path: ordered[i], length: committedEnd });
     }
@@ -657,31 +684,353 @@ function scanDirectory(dir) {
     removable,
     reset,
     activeId,
+    ordered,
+    startAt,
+    logBytes,
+    watermarkAtStart,
   };
 }
 
-// Messages with seq > pos that survived truncation, snapshot first then the
-// live suffix, ascending. A position below the truncation horizon starts at
-// the earliest surviving message: the gap is already truncated. Log-side
-// messages at/below foldedSeq are covered by the snapshot and skipped.
-const messagesAfter = (st, pos) => {
-  const floor = Math.max(pos, st.horizon);
-  const out = [];
-  for (const m of st.baseMessages) {
-    if (m.seq > floor) {
-      // Snapshot messages are shared in-memory objects; hand out a copy so
-      // callers cannot mutate replay/read results for later calls.
-      out.push({ seq: m.seq, id: m.id, record: structuredClone(m.record) });
+// ---- lock-free read view -------------------------------------------------
+// Every read path (replay, consumer reads, stats, usage, readRange) is
+// served from a ReaderState assembled WITHOUT the cross-process mutex and
+// — on the hot path — without a directory walk: a steady-state refresh
+// stats the active log and parses only the bytes appended since the
+// previous look, exactly like the writer's incremental cursor. A
+// structural change (a seal/compaction/truncation replacing the log head,
+// a torn or uncommitted tail) escalates to one coherent rebuild through
+// scanDirectory, itself a strictly read-only walk, and the fresh state is
+// swapped in atomically — a read racing a snapshot switch observes either
+// the whole old view or the whole new one, never a mixture, so the same
+// range fetched either side of the switch agrees message for message.
+//
+// Log-side message payloads are not held in memory: each committed
+// message is a locator { seq, bytes, path, off, len } and the record (and
+// its id) is read back from its file on demand, so fetching a range costs
+// in proportion to the batch returned, not to the length of the log.
+// Snapshot-folded survivors are kept parsed, mirroring the writer view.
+
+// Read a slice [off, off + length) of a regular file synchronously.
+const readSlice = (file, off, length) => {
+  const buf = Buffer.allocUnsafe(length);
+  const fd = openSync(file, 'r');
+  try {
+    let got = 0;
+    while (got < length) {
+      const n = readSync(fd, buf, got, length - got, off + got);
+      if (!Number.isInteger(n) || n <= 0) break;
+      got += n;
     }
+    return buf.subarray(0, got);
+  } finally {
+    closeSync(fd);
   }
-  const logFloor = Math.max(floor, st.foldedSeq);
-  for (const m of st.live) {
-    if (m.seq > logFloor) {
-      out.push({ seq: m.seq, id: m.id, record: structuredClone(m.record) });
-    }
-  }
-  return out;
 };
+
+// A locator read raced a truncation/compaction/heal that reshaped the
+// file underneath it; the caller rebuilds the view once and retries.
+class ReadConflict extends Error {}
+
+// Fetch and parse the message line a locator points at, verifying it is
+// still the message the view indexed. The id travels with the line, so
+// locators stay small; the caller takes id and record from the entry.
+const readEntry = (loc) => {
+  let raw;
+  try {
+    raw = readSlice(loc.path, loc.off, loc.len);
+  } catch {
+    throw new ReadConflict('log file vanished under the read view');
+  }
+  if (raw.length < loc.len) {
+    throw new ReadConflict('log file shrank under the read view');
+  }
+  let entry;
+  try {
+    entry = JSON.parse(raw.toString('utf8'));
+  } catch {
+    throw new ReadConflict('log line no longer parses');
+  }
+  if (!entry || entry.t !== 'm' || entry.seq !== loc.seq) {
+    throw new ReadConflict('log line no longer matches the indexed message');
+  }
+  return entry;
+};
+
+// First index in a seq-ascending array whose seq is greater than `pos`.
+const lowerBoundSeq = (arr, pos) => {
+  let lo = 0;
+  let hi = arr.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (arr[mid].seq <= pos) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+};
+
+/**
+ * Committed message locators of one log-chain file, recovered with the
+ * same bracket/fence rules as committedUnits but keeping only message
+ * positions (seq/bytes plus the byte span of the message's line), never
+ * payloads or ids. `base` offsets every span by the absolute file offset
+ * of `raw[0]` so records can be fetched straight from disk. The
+ * positional fence watermark threads across files in chain order exactly
+ * like recovery.
+ */
+function committedSpans(raw, startWatermark, file, base) {
+  const spans = [];
+  let watermark = startWatermark;
+  let lineStart = 0;
+  let group = null;
+  const stale = (entry) =>
+    entry !== null && typeof entry.g === 'number' && entry.g < watermark;
+  for (let i = 0; i < raw.length; i++) {
+    if (raw[i] !== 0x0a) continue;
+    const entry = i > lineStart ? JSON.parse(raw.toString('utf8', lineStart, i)) : null;
+    if (entry && entry.t === 'f') {
+      if (typeof entry.g === 'number' && entry.g > watermark) watermark = entry.g;
+      group = null;
+    } else if (group !== null) {
+      if (stale(entry)) {
+        // A preempted holder's bytes never close or enter the group.
+      } else if (entry && entry.t === 'bk' && entry.id === group.id) {
+        for (const member of group.entries) spans.push(member);
+        group = null;
+      } else if (entry && entry.t === 'b') {
+        group = { id: entry.id, entries: [] };
+      } else if (entry && entry.t === 'm') {
+        group.entries.push({
+          seq: entry.seq,
+          bytes: entry.bytes,
+          path: file,
+          off: base + lineStart,
+          len: i - lineStart,
+        });
+      }
+    } else if (entry && entry.t === 'b') {
+      if (!stale(entry)) group = { id: entry.id, entries: [] };
+    } else if (entry && entry.t === 'm' && !stale(entry)) {
+      spans.push({
+        seq: entry.seq,
+        bytes: entry.bytes,
+        path: file,
+        off: base + lineStart,
+        len: i - lineStart,
+      });
+    }
+    lineStart = i + 1;
+  }
+  return { spans, watermark };
+}
+
+class ReaderState {
+  constructor(init) {
+    this.logPath = init.logPath;
+    // Merged counters and tables, same shape the writer view keeps.
+    this.seq = init.seq;
+    this.bytes = init.bytes;
+    this.published = init.published;
+    this.replayed = init.replayed;
+    this.usageBytes = init.usageBytes;
+    this.horizon = init.horizon;
+    this.foldedSeq = init.foldedSeq;
+    this.gen = init.gen;
+    this.positions = init.positions;
+    // Snapshot-folded survivors above the horizon, ascending by seq:
+    // { seq, id, record, size }.
+    this.base = init.base;
+    // Log-side committed messages above max(horizon, foldedSeq), ascending
+    // by seq, as locators into segment/log files.
+    this.locs = init.locs;
+    // Identity of the active log this state is current through, or null
+    // when the view does not track one (no active log, or a mid-reset
+    // directory whose log content is entirely snapshot-folded).
+    this.active = init.active;
+    this.watermark = init.watermark;
+  }
+
+  /**
+   * Advance in place over newly appended committed bytes of the SAME
+   * active log. Returns true when the directory changed structurally and
+   * the caller must rebuild. A tail that is not yet a clean committed
+   * prefix (a group mid-flush, a torn line) is not an error: the state
+   * simply keeps the last committed view and retries next time.
+   */
+  catchup() {
+    let info;
+    try {
+      info = statSync(this.logPath);
+    } catch {
+      info = null;
+    }
+    if (!this.active) {
+      // No tracked active log: only the appearance of one is structural.
+      return info !== null;
+    }
+    if (info === null) return true;
+    if (info.dev !== this.active.dev || info.ino !== this.active.ino) return true;
+    if (info.size < this.active.size) return true;
+    if (info.size === this.active.size) return false;
+    const headNow = readHeadSync(this.logPath);
+    if (headNow !== this.active.head) return true;
+    const raw = readSlice(this.logPath, this.active.size, info.size - this.active.size);
+    if (raw.length < info.size - this.active.size) return true;
+    let parsed;
+    try {
+      parsed = committedUnits(raw, this.watermark);
+    } catch {
+      return true; // a corrupt tail is for the full scan to judge
+    }
+    if (parsed.structural) return true;
+    if (!parsed.closed || parsed.torn) return false;
+    const floor = Math.max(this.horizon, this.foldedSeq);
+    for (let k = 0; k < parsed.units.length; k++) {
+      const entry = parsed.units[k];
+      const span = parsed.spans[k];
+      if (entry.t === 'm') {
+        if (entry.seq <= this.horizon) continue;
+        this.seq = entry.seq;
+        this.bytes += entry.bytes;
+        this.published += 1;
+        this.usageBytes += entry.bytes;
+        if (entry.seq > floor) {
+          this.locs.push({
+            seq: entry.seq,
+            bytes: entry.bytes,
+            path: this.logPath,
+            off: this.active.size + span.off,
+            len: span.len,
+          });
+        }
+      } else if (entry.t === 's') {
+        this.replayed += entry.n;
+      } else if (entry.t === 'p') {
+        this.positions.set(entry.name, entry.pos);
+      }
+    }
+    this.watermark = parsed.watermark;
+    this.active = {
+      dev: info.dev,
+      ino: info.ino,
+      size: info.size,
+      head: this.active.head,
+    };
+    return false;
+  }
+
+  /**
+   * Messages with seq > pos, ascending, at most `limit` (Infinity for
+   * all): snapshot survivors first, then log-side locators — the two are
+   * seq-disjoint and each ascending, exactly the baseline's merged order.
+   * A position inside a truncated gap starts at the earliest survivor.
+   */
+  rangeFrom(pos, limit = Infinity) {
+    const out = [];
+    if (limit <= 0) return out;
+    const baseBound = Math.max(pos, this.horizon);
+    const logBound = Math.max(baseBound, this.foldedSeq);
+    let i = lowerBoundSeq(this.base, baseBound);
+    while (i < this.base.length && out.length < limit) {
+      const m = this.base[i++];
+      // Snapshot records are shared in-memory objects; hand out a copy so
+      // callers cannot mutate the view for later reads.
+      out.push({ seq: m.seq, id: m.id, record: structuredClone(m.record) });
+    }
+    let j = lowerBoundSeq(this.locs, logBound);
+    while (j < this.locs.length && out.length < limit) {
+      const loc = this.locs[j++];
+      const entry = readEntry(loc);
+      out.push({ seq: loc.seq, id: entry.id, record: entry.record });
+    }
+    return out;
+  }
+}
+
+/**
+ * Assemble one coherent ReaderState from a (read-only) directory scan.
+ * The locator walk re-reads exactly the bytes the scan processed — the
+ * active log only up to the scan's own processed length — so counters and
+ * message positions always describe the same committed prefix. Message
+ * filtering mirrors recovery precisely: pre-anchor segments contribute
+ * only above max(horizon, foldedSeq), the suffix above the horizon, and
+ * the fence watermark applies positionally across the chain.
+ */
+function buildReaderState(dir, st) {
+  const logPath = path.join(dir, LOG_NAME);
+  const floor = Math.max(st.horizon, st.foldedSeq);
+  const base = [];
+  let usageBytes = 0;
+  for (const m of st.baseMessages) {
+    if (m.seq > st.horizon) {
+      const size = Buffer.byteLength(JSON.stringify(m.record), 'utf8');
+      base.push({ seq: m.seq, id: m.id, record: m.record, size });
+      usageBytes += size;
+    }
+  }
+  const locs = [];
+  const seen = new Set();
+  // Files the scan already ruled out (pre-anchor segments folded into the
+  // snapshot or covered by the horizon, physically unlinked by the next
+  // writer heal): skip them here too, or their bytes would double-count
+  // against the snapshot survivors in `base`.
+  const removed = new Set(st.removable);
+  // A mid-reset directory (snapshot landed, log not yet replaced) has
+  // every log byte already folded into the snapshot: nothing to index.
+  const files = st.reset ? [] : st.ordered;
+  for (let i = 0; i < files.length; i++) {
+    const file = files[i];
+    if (removed.has(file)) continue;
+    let raw;
+    if (file === logPath) {
+      raw = readSlice(file, 0, st.logBytes);
+      if (raw.length < st.logBytes) {
+        throw new ReadConflict('active log changed while indexing');
+      }
+    } else {
+      // A segment a concurrent truncation just unlinked makes this build
+      // stale; the caller retries against the settled directory.
+      raw = readFileSync(file);
+    }
+    // The positional fence watermark exactly as the scan computed it for
+    // this file's position in the chain.
+    const walked = committedSpans(raw, st.watermarkAtStart[i], file, 0);
+    const isSuffix = i >= st.startAt;
+    for (const span of walked.spans) {
+      if (span.seq <= st.horizon) continue; // discarded by truncation
+      if (!isSuffix && span.seq <= floor) continue; // folded into the snapshot
+      usageBytes += span.bytes;
+      if (span.seq <= floor || seen.has(span.seq)) continue;
+      seen.add(span.seq);
+      locs.push(span);
+    }
+  }
+  locs.sort((a, b) => a.seq - b.seq);
+  const hasActive =
+    !st.reset && files.length > 0 && files[files.length - 1] === logPath;
+  return new ReaderState({
+    logPath,
+    seq: st.seq,
+    bytes: st.bytes,
+    published: st.published,
+    replayed: st.replayed,
+    usageBytes,
+    horizon: st.horizon,
+    foldedSeq: st.foldedSeq,
+    gen: st.snapshotGen,
+    positions: new Map(st.positions),
+    base,
+    locs,
+    active: hasActive
+      ? {
+          dev: st.activeId.dev,
+          ino: st.activeId.ino,
+          size: st.logBytes,
+          head: st.activeId.head,
+        }
+      : null,
+    watermark: st.fenceEpoch,
+  });
+}
 
 export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
   if (typeof dir !== 'string' || dir.length === 0) {
@@ -1469,67 +1818,122 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
     }
 
     // Gather staged requests oldest first; mtime is the cross-process
-    // enqueue order, the token is a deterministic tie-breaker.
-    const files = [];
-    for (const name of readdirSync(dir)) {
-      const m = QUEUE_RE.exec(name);
-      if (!m) continue;
-      let mt = 0;
-      try {
-        mt = statSync(path.join(dir, name)).mtimeMs;
-      } catch {
-        mt = 0;
+    // enqueue order, the token is a deterministic tie-breaker. Runs once
+    // at the drain entrance and again inside the coalescing window below.
+    const gatherStaged = () => {
+      const files = [];
+      for (const name of readdirSync(dir)) {
+        const m = QUEUE_RE.exec(name);
+        if (!m) continue;
+        let mt = 0;
+        try {
+          mt = statSync(path.join(dir, name)).mtimeMs;
+        } catch {
+          mt = 0;
+        }
+        files.push({ name, token: m[1], mt });
       }
-      files.push({ name, token: m[1], mt });
-    }
-    files.sort((a, b) => (a.mt !== b.mt ? a.mt - b.mt : a.token < b.token ? -1 : 1));
+      files.sort((a, b) => (a.mt !== b.mt ? a.mt - b.mt : a.token < b.token ? -1 : 1));
 
-    const requests = [];
-    for (const f of files) {
-      let req = null;
-      try {
-        req = JSON.parse(readFileSync(path.join(dir, f.name), 'utf8'));
-      } catch {
-        req = null;
-      }
-      // A token carrying an outcome is already settled; drop the leftover.
-      const settled = readOutcome(f.token);
-      if (settled !== null) {
+      const gathered = [];
+      for (const f of files) {
+        let req = null;
         try {
-          rmSync(path.join(dir, f.name), { force: true });
+          req = JSON.parse(readFileSync(path.join(dir, f.name), 'utf8'));
         } catch {
-          // Concurrent cleanup.
+          req = null;
         }
-        continue;
-      }
-      if (!req || !Array.isArray(req.items) || typeof req.s !== 'string') {
-        // Corrupt/half queue file (never expected: staging is atomic): take
-        // no byte from it and remove.
-        try {
-          rmSync(path.join(dir, f.name), { force: true });
-        } catch {
-          // Already gone.
+        // A token carrying an outcome is already settled; drop the leftover.
+        const settled = readOutcome(f.token);
+        if (settled !== null) {
+          try {
+            rmSync(path.join(dir, f.name), { force: true });
+          } catch {
+            // Concurrent cleanup.
+          }
+          continue;
         }
-        continue;
-      }
-      if (!heartbeatAlive(req.s)) {
-        // Dead requester: orphaned intent, never drained.
-        try {
-          rmSync(path.join(dir, f.name), { force: true });
-        } catch {
-          // Already gone.
+        if (!req || !Array.isArray(req.items) || typeof req.s !== 'string') {
+          // Corrupt/half queue file (never expected: staging is atomic): take
+          // no byte from it and remove.
+          try {
+            rmSync(path.join(dir, f.name), { force: true });
+          } catch {
+            // Already gone.
+          }
+          continue;
         }
-        continue;
+        if (!heartbeatAlive(req.s)) {
+          // Dead requester: orphaned intent, never drained.
+          try {
+            rmSync(path.join(dir, f.name), { force: true });
+          } catch {
+            // Already gone.
+          }
+          continue;
+        }
+        // Epoch barrier at the pipeline boundary: a request a preempted
+        // holder queued before losing ownership fails wholesale and no byte
+        // of it mixes into the group.
+        if (typeof req.e !== 'number' || req.e !== lease.epoch) {
+          gathered.push({ token: f.token, stale: true });
+          continue;
+        }
+        gathered.push({ token: f.token, kind: req.k === 'batch' ? 'batch' : 'single', items: req.items });
       }
-      // Epoch barrier at the pipeline boundary: a request a preempted
-      // holder queued before losing ownership fails wholesale and no byte
-      // of it mixes into the group.
-      if (typeof req.e !== 'number' || req.e !== lease.epoch) {
-        requests.push({ token: f.token, stale: true });
-        continue;
+      return gathered;
+    };
+
+    let requests = gatherStaged();
+
+    // Coalescing window: while other live sessions share the lease, a
+    // request staged a heartbeat after the first gather — one that arrived
+    // while this process waited for the mutex, or while the gather ran —
+    // would otherwise need a second lock round and a second commit group.
+    // Re-gather until a short quiet interval sees no new tokens (bounded,
+    // so a continuous staging rate can never hold the mutex) and merge the
+    // late arrivals into THIS group. A single-holder lease skips the wait
+    // entirely: nobody else can be staging. BUS_DRAIN_MERGE_MS overrides
+    // the quiet interval (0 disables).
+    const mergeMs = seamNumber('BUS_DRAIN_MERGE_MS') || DRAIN_MERGE_MS;
+    if (lease.sessions.length > 1 && mergeMs > 0) {
+      const seen = new Set(requests.map((r) => r.token));
+      const started = Date.now();
+      let quietSince = started;
+      const cap = mergeMs * 4;
+      for (;;) {
+        writeHeartbeat();
+        sleepSync(Math.min(2, mergeMs));
+        let arrived = 0;
+        for (const r of gatherStaged()) {
+          if (!seen.has(r.token)) {
+            seen.add(r.token);
+            requests.push(r);
+            arrived += 1;
+          }
+        }
+        const now = Date.now();
+        if (arrived > 0) quietSince = now;
+        if (now - quietSince >= mergeMs || now - started >= cap) break;
       }
-      requests.push({ token: f.token, kind: req.k === 'batch' ? 'batch' : 'single', items: req.items });
     }
+
+    // Retire a settled token's staging files: the queue itself and any
+    // orphaned staging tmp a frozen requester left behind. A preempted
+    // holder's queued group fails wholesale AND disappears wholesale — no
+    // file of it lingers to be drained a second time.
+    const retireQueue = (token) => {
+      try {
+        rmSync(qPath(token), { force: true });
+      } catch {
+        // Already drained/removed.
+      }
+      try {
+        rmSync(qTmpPath(token), { force: true });
+      } catch {
+        // Already gone.
+      }
+    };
 
     // Plan the merged group. Each request is resolved as a whole against
     // the running merged plan; a request that over quota contributes
@@ -1620,11 +2024,7 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
     if (groupCount === 0) {
       for (const r of results) {
         writeOutcomeLocked(r.token, r.result);
-        try {
-          rmSync(qPath(r.token), { force: true });
-        } catch {
-          // Already drained/removed.
-        }
+        retireQueue(r.token);
       }
       const own = results.find((r) => r.token === ownToken);
       return own ? own.result : null;
@@ -1744,11 +2144,7 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
         };
         for (const r of results) {
           writeOutcomeLocked(r.token, failResult);
-          try {
-            rmSync(qPath(r.token), { force: true });
-          } catch {
-            // Leftover: the outcome settles it regardless.
-          }
+          retireQueue(r.token);
         }
         try {
           rmSync(cPath(gid), { force: true });
@@ -1766,11 +2162,7 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
       // so no token can settle as success.
       for (const r of results) {
         writeOutcomeLocked(r.token, fenceResult);
-        try {
-          rmSync(qPath(r.token), { force: true });
-        } catch {
-          // Leftover: the outcome settles it regardless.
-        }
+        retireQueue(r.token);
       }
       try {
         rmSync(cPath(gid), { force: true });
@@ -1827,11 +2219,7 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
     let allSettled = true;
     for (const r of results) {
       if (writeOutcomeLocked(r.token, r.result)) {
-        try {
-          rmSync(qPath(r.token), { force: true });
-        } catch {
-          // Leftover: the outcome settles it on the next sweep.
-        }
+        retireQueue(r.token);
       } else {
         allSettled = false;
       }
@@ -1922,22 +2310,20 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
   // Run `fn(lease, view)` under the cross-process lock with a valid
   // credential. `view` is the merged directory state kept current by the
   // incremental tail reader (a full scan happens only on structural
-  // change). Read-only callers (position lookups) never assert the
-  // credential and never heal, so a fenced instance can still read.
-  const withOwnership = (fn, { waitMs = LOCK_WAIT_MS, readonly = false } = {}) =>
+  // change). Pure reads never come through here at all: they are served
+  // by the lock-free read view, so a fenced instance can still read.
+  const withOwnership = (fn, { waitMs = LOCK_WAIT_MS } = {}) =>
     withLockSync(() => {
       if (closed || broken) {
         throw new Error('bus is closed');
       }
       const lease = readLeaseLocked();
-      if (!readonly) {
-        assertOwnershipLocked(lease);
-        // Entering the critical section counts as a fresh liveness signal
-        // for the whole (synchronous, timer-frozen) job; the long phases
-        // refresh again between fsyncs.
-        writeHeartbeat();
-      }
-      catchupLocked({ mutating: !readonly });
+      assertOwnershipLocked(lease);
+      // Entering the critical section counts as a fresh liveness signal
+      // for the whole (synchronous, timer-frozen) job; the long phases
+      // refresh again between fsyncs.
+      writeHeartbeat();
+      catchupLocked({ mutating: true });
       return fn(lease, view);
     }, waitMs);
 
@@ -1976,6 +2362,14 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
   const commitThroughPipeline = (kind, items) => {
     const token = newToken();
     stageRequest(token, kind, items);
+    // A request staged by an instance that has already lost ownership
+    // fails wholesale right here: the drain's epoch boundary would reject
+    // it anyway, and no byte of it may ever mix into the log. Withdraw
+    // the staging files so nothing of the group lingers to be drained.
+    if (fenced) {
+      cleanupStaged(token, true);
+      throw new Error(FENCE_MESSAGE);
+    }
     let outcome = null;
     let lastErr = null;
     // A contended mutex is retried with the SAME token: staging is
@@ -2133,20 +2527,44 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
   // Position writes are synchronous (register/advance/read are synchronous
   // methods). Under multi-writer they still take the lock and validate the
   // credential, and the merged position map comes from the shared files.
-  const persistPosition = (name, pos) => {
+  // The merged table is re-checked inside the lock: a position another
+  // process committed first always wins (register stays idempotent), and
+  // an advance that raced a peer's larger advance is rejected as backwards
+  // rather than silently moving the shared position down. Returns the
+  // position actually in effect.
+  const persistPosition = (name, pos, forAdvance = false) => {
+    let finalPos;
+    let backwards = false;
     try {
       withOwnership(() => {
+        const current = view.positions.get(name);
+        if (current !== undefined) {
+          if (forAdvance && pos < current) {
+            backwards = true;
+            return;
+          }
+          if (current >= pos) {
+            // Already registered at least this far: nothing to write.
+            finalPos = current;
+            return;
+          }
+        }
         const line = JSON.stringify({ t: 'p', name, pos, g: epoch }) + '\n';
         appendTo(logPath, Buffer.from(line, 'utf8'), fsync);
         // Reflect locally on the cached view without a full rescan.
         view.positions.set(name, pos);
         syncScalars();
         noteAppended(Buffer.byteLength(line, 'utf8'));
+        finalPos = pos;
       });
     } catch (err) {
       if (!fenced && !isLockError(err)) broken = true;
       throw err;
     }
+    if (backwards) {
+      throw new RangeError('advance: position cannot move backwards');
+    }
+    return finalPos;
   };
 
   const assertOpen = () => {
@@ -2175,16 +2593,63 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
   const renewTimer = setInterval(renew, RENEW_MS);
   renewTimer.unref?.();
 
-  const bestEffortView = () => {
+  // ---- lock-free read view ---------------------------------------------
+  // The committed directory state as a read cache that never takes the
+  // cross-process mutex and never walks the directory on the hot path:
+  // refreshes parse only newly appended bytes, and a structural change
+  // (seal/compaction/truncation) swaps in one coherent rebuild.
+  let reader = null;
+
+  // Bring the read view current without the mutex. A race with a
+  // seal/delete/rename mid-assembly retries with a short backoff; a
+  // settled (if slightly stale) view always beats no view, so reads keep
+  // working while writers commit continuously.
+  const ensureReader = () => {
+    let lastErr = null;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        if (reader !== null && !reader.catchup()) return reader;
+        reader = buildReaderState(dir, scanDirectory(dir));
+        return reader;
+      } catch (err) {
+        lastErr = err;
+        sleepSync(1 << attempt);
+      }
+    }
+    if (reader !== null) return reader;
+    throw lastErr;
+  };
+
+  // Serve one range read from a coherent view, rebuilding when a locator
+  // hits a file a concurrent truncation/compaction reshaped underneath.
+  const rangeMessages = (pos, limit) => {
+    let lastErr = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const st = closed && reader !== null ? reader : ensureReader();
+      try {
+        return st.rangeFrom(pos, limit);
+      } catch (err) {
+        if (!(err instanceof ReadConflict)) throw err;
+        lastErr = err;
+        reader = null; // force a rebuild against the settled directory
+      }
+    }
+    throw lastErr;
+  };
+
+  // Adopt a fresh locked scan as the read view after a structural write
+  // (compaction/truncation) so the very next read needs no rebuild.
+  const refreshReaderFrom = (st) => {
     try {
-      withLockSync(() => {
-        // Read-only adoption of the merged view; never heal here.
-        catchupLocked({ mutating: false });
-      }, VIEW_WAIT_MS);
+      reader = buildReaderState(dir, st);
     } catch {
-      // Lock held by a writer right now: the cached view stays valid.
+      reader = null; // a later read rebuilds from the settled directory
     }
   };
+
+  // Prime the read view from the same settled scan the writer cache
+  // adopted at open, so the first read needs no directory walk either.
+  if (view) refreshReaderFrom(view);
 
   const bus = {
     publish(record) {
@@ -2384,54 +2849,57 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
       if (typeof from !== 'number' || !Number.isInteger(from) || from < 0) {
         return Promise.reject(new RangeError('replay: from must be a non-negative integer'));
       }
-
-      return enqueue(() => {
-        if (closed || broken) {
-          throw new Error('bus is closed');
-        }
-        return withOwnership(() => {
-          // Message payloads are not kept in the write hot-cache, so a read
-          // takes a fresh non-destructive directory scan (the same scan the
-          // baseline paid; the write drain never does).
-          const full = scanDirectory(dir);
-          adoptFullScan(full);
-          // replay(from) is inclusive of from; messagesAfter takes an
-          // exclusive lower bound. Replay does not drain staged publish
-          // requests: lock acquisition order is the total order, so a
-          // request still only staged lands after this marker.
-          const out = messagesAfter(view, from - 1);
-          const n = out.length;
-          if (n > 0) {
-            const line = JSON.stringify({ t: 's', n, g: epoch }) + '\n';
-            try {
-              appendTo(logPath, Buffer.from(line, 'utf8'), fsync);
-            } catch (err) {
-              broken = true;
-              throw err;
-            }
-            reassertLocked();
-            view.replayed += n;
-            syncScalars();
-            noteAppended(Buffer.byteLength(line, 'utf8'));
+      if (broken) {
+        return Promise.reject(new Error('bus is closed'));
+      }
+      if (fenced) {
+        // The replay marker is a write; a displaced holder loses it (and
+        // thus the replay) exactly as before, even for an empty range.
+        return Promise.reject(new Error('bus write ownership has been invalidated'));
+      }
+      // Reads no longer queue on the write serial chain: the range comes
+      // from the lock-free read view (always a committed prefix — a group
+      // still mid-flush is wholly invisible), and only the replay marker,
+      // a stat line rather than payload, still goes through the
+      // cross-process mutex — directly, never queued behind this
+      // instance's own writes.
+      let out;
+      try {
+        out = rangeMessages(from - 1, Infinity);
+      } catch (err) {
+        return Promise.reject(err);
+      }
+      if (out.length === 0) {
+        return Promise.resolve(out);
+      }
+      try {
+        withOwnership(() => {
+          const line = JSON.stringify({ t: 's', n: out.length, g: epoch }) + '\n';
+          try {
+            appendTo(logPath, Buffer.from(line, 'utf8'), fsync);
+          } catch (err) {
+            broken = true;
+            throw err;
           }
-          return out;
+          reassertLocked();
+          view.replayed += out.length;
+          syncScalars();
+          noteAppended(Buffer.byteLength(line, 'utf8'));
         });
-      });
+      } catch (err) {
+        return Promise.reject(err);
+      }
+      return Promise.resolve(out);
     },
 
     register(name) {
       if (closed || broken) throw new Error('bus is closed');
       assertName(name);
-      // The authoritative position table is the shared one. Read-only
-      // lookup: no healing, no credential check (works even after a
-      // takeover); only registering a brand-new name writes and is fenced.
-      let current;
-      try {
-        current = withOwnership(() => view.positions.get(name), { readonly: true });
-      } catch (err) {
-        if (!fenced && !isLockError(err)) broken = true;
-        throw err;
-      }
+      // The authoritative position table is the shared one, read through
+      // the lock-free view: no mutex, no credential check (works even
+      // after a takeover). Only registering a brand-new name writes, and
+      // a fenced instance may not do that.
+      const current = ensureReader().positions.get(name);
       // Re-registering an existing name must not reset its position.
       if (current !== undefined) {
         return current;
@@ -2439,8 +2907,7 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
       if (fenced) {
         throw new Error('bus write ownership was taken over by another process');
       }
-      persistPosition(name, 0);
-      return 0;
+      return persistPosition(name, 0);
     },
 
     advance(name, to) {
@@ -2449,15 +2916,10 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
       if (typeof to !== 'number' || !Number.isInteger(to) || to < 0) {
         throw new RangeError('advance: position must be a non-negative integer');
       }
-      // Read the merged current value under the lock so two processes
-      // advancing the same consumer obey the no-backwards rule together.
-      let current;
-      try {
-        current = withOwnership(() => view.positions.get(name), { readonly: true });
-      } catch (err) {
-        if (!fenced && !isLockError(err)) broken = true;
-        throw err;
-      }
+      // Pre-check against the lock-free read view; the locked write
+      // re-checks the merged table, so two processes advancing the same
+      // consumer obey the no-backwards rule together.
+      const current = ensureReader().positions.get(name);
       if (current !== undefined) {
         if (to < current) {
           throw new RangeError('advance: position cannot move backwards');
@@ -2467,8 +2929,7 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
         }
       }
       // An unknown name is auto-registered, same as register() first.
-      persistPosition(name, to);
-      return to;
+      return persistPosition(name, to, true);
     },
 
     read(name) {
@@ -2476,28 +2937,32 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
         throw new Error('bus is closed');
       }
       assertName(name);
-      // Read-only: even a fenced instance may read, but an unknown name is
-      // auto-registered (a write), which a fenced instance may not do.
-      // Message payloads live on disk, not the write hot-cache, so a read
-      // takes its own non-destructive scan.
-      let pos;
-      let readView;
-      try {
-        withOwnership(() => {
-          readView = scanDirectory(dir);
-          pos = readView.positions.get(name);
-        }, { readonly: true });
-      } catch (err) {
-        if (!fenced && !isLockError(err)) broken = true;
-        throw err;
-      }
+      // Lock-free read: positions and messages come from the read view,
+      // so even a fenced instance reads and no read ever queues behind a
+      // writer. An unknown name is auto-registered (a write), which a
+      // fenced instance may not do.
+      let pos = ensureReader().positions.get(name);
       if (pos === undefined) {
-        // Persists a position line, so it validates the credential.
-        persistPosition(name, 0);
-        pos = 0;
+        pos = persistPosition(name, 0);
       }
       // read never moves the position; advance() is how consumption lands.
-      return messagesAfter(readView, pos);
+      return rangeMessages(pos, Infinity);
+    },
+
+    readRange(start, limit) {
+      // Validation is synchronous and independent of liveness — like
+      // truncate's bound, a closed or fenced bus still validates.
+      if (typeof start !== 'number' || !Number.isInteger(start) || start < 0) {
+        throw new TypeError('readRange: start must be a non-negative integer');
+      }
+      if (typeof limit !== 'number' || !Number.isInteger(limit) || limit <= 0) {
+        throw new TypeError('readRange: limit must be a positive integer');
+      }
+      // Inclusive of `start`, ascending, at most `limit` entries; a start
+      // inside a truncated gap begins at the earliest survivor and a fully
+      // deleted range yields []. Served from the lock-free read view, so
+      // it stays available after close and never queues behind writers.
+      return rangeMessages(start - 1, limit);
     },
 
     compact() {
@@ -2627,6 +3092,7 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
           let settled = scanDirectory(dir);
           if (healLocked(settled)) settled = scanDirectory(dir);
           adoptFullScan(settled);
+          refreshReaderFrom(settled);
         });
       });
     },
@@ -2701,7 +3167,9 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
           // Nothing can go: the roll above (if any) is the only effect.
           // Write no marker; the fresh active log stays empty.
           if (doomed.length === 0) {
-            adoptFullScan(scanDirectory(dir));
+            const scanned = scanDirectory(dir);
+            adoptFullScan(scanned);
+            refreshReaderFrom(scanned);
             return;
           }
 
@@ -2775,14 +3243,29 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
           // construction — only the marker carries them.
           st = scanDirectory(dir);
           adoptFullScan(st);
+          refreshReaderFrom(st);
         });
       });
     },
 
     stats() {
       // Reading the merged counters is allowed even after a takeover: only
-      // writes/truncation are fenced. After close the last cache stands.
-      if (!closed) bestEffortView();
+      // writes/truncation are fenced. Served from the lock-free read view,
+      // so stats never queue behind a writer; after close the last cache
+      // stands.
+      try {
+        const st = closed ? reader : ensureReader();
+        if (st) {
+          return {
+            seq: st.seq,
+            bytes: st.bytes,
+            published: st.published,
+            replayed: st.replayed,
+          };
+        }
+      } catch {
+        // The directory is unreadable right now: the last cache stands.
+      }
       return { seq, bytes, published, replayed };
     },
 
@@ -2790,7 +3273,12 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
     // retention truncation). Compaction does not change it; an empty bus is
     // zero. Merged across writers. Readable after close, like stats().
     usage() {
-      if (!closed) bestEffortView();
+      try {
+        const st = closed ? reader : ensureReader();
+        if (st) return st.usageBytes;
+      } catch {
+        // The directory is unreadable right now: the last cache stands.
+      }
       return usageBytes;
     },
 
@@ -2853,6 +3341,13 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
         } catch {
           // Closing never rejects: the lease heartbeat expiry reclaims the
           // session even if the lock cannot be taken right now.
+        }
+        // Freeze the read view at the final committed state: stats(),
+        // usage() and readRange() after close serve the last cache.
+        try {
+          ensureReader();
+        } catch {
+          // The last cache stands regardless.
         }
       });
     },

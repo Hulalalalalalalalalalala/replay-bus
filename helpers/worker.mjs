@@ -27,6 +27,8 @@ const run = async (cmd) => {
       return { value: bus.advance(cmd.name, cmd.to) };
     case 'read':
       return { value: bus.read(cmd.name) };
+    case 'readRange':
+      return { value: bus.readRange(cmd.start, cmd.limit) };
     case 'compact':
       await bus.compact();
       return { value: null };
