@@ -1,6 +1,7 @@
 import {
   openSync,
   closeSync,
+  readSync,
   writeSync,
   fsyncSync,
   mkdirSync,
@@ -41,6 +42,21 @@ const HB_TMP_PREFIX = 'bus.hb.tmp.';
 // Every temp file a write uses is session-scoped under one of these
 // prefixes, so two writers never clobber each other's tmp; stale leftovers
 // from a crashed holder are swept under the lock on the next open.
+//
+// Commit pipeline files. Writers stage publish/publishBatch requests into
+// bus.q.<token>.json WITHOUT holding the mutex (after sync validation and
+// reservation), then take the lock and drain the whole staging area: every
+// staged request from every process is merged into ONE bracketed commit
+// group, so one flush covers the combined set. The drain's plan (seqs,
+// dedup, per-request quota, stats) is persisted in a decision file before
+// the group is flushed, and per-request outcomes (acks / rejection) are
+// written to bus.r.<token>.json so a request drained by another process —
+// or after a crash mid-flush — is adopted with the same first
+// acknowledgement. A chunked group's torn tail is healed against the
+// decision: missing chunks make the whole group invisible.
+const QUEUE_PREFIX = 'bus.q.';
+const DECISION_PREFIX = 'bus.c.';
+const RESULT_PREFIX = 'bus.r.';
 const TMP_PREFIXES = [
   'bus.owner.tmp.',
   'bus.epoch.tmp.',
@@ -49,11 +65,23 @@ const TMP_PREFIXES = [
   'bus.snapshot.mirror.tmp.',
   'bus.log.tmp.',
   'bus.log.reset.tmp.',
+  'bus.q.tmp.',
+  'bus.c.tmp.',
+  'bus.r.tmp.',
 ];
 const envLease = Number(process.env.BUS_LEASE_MS);
 const LEASE_MS = envLease > 0 ? envLease : 3000;
 const envRenew = Number(process.env.BUS_RENEW_MS);
 const RENEW_MS = envRenew > 0 ? envRenew : Math.min(250, Math.floor(LEASE_MS / 10));
+// Test/diagnostic seams (not part of the public surface), read live so
+// they can be toggled per test:
+//  - BUS_DRAIN_DELAY_MS: hold the mutex at the drain entrance (heartbeat
+//    kept fresh) so concurrently staged requests deterministically join
+//    the same commit group.
+//  - BUS_DRAIN_STALL_MS: after the first flush chunk block WITHOUT
+//    refreshing the heartbeat, reproducing a holder seized mid group.
+//  - BUS_FLUSH_FAIL_AT: fail the flush once this many group bytes are down.
+const seamNumber = (name) => Number(process.env[name]) || 0;
 // A mutex directory untouched for longer than this, whose owning session's
 // heartbeat is also stale, belongs to a process that died mid-job; the next
 // waiter breaks it.
@@ -74,6 +102,13 @@ const segmentName = (index) => `bus.${String(index).padStart(10, '0')}.jsonl`;
 // as the legacy/canonical form (older buses and hand-crafted layouts).
 const SNAPSHOT_SCOPED_RE = /^bus\.snapshot\.g(\d+)\.e(\d+)\.json$/;
 const snapshotScopedName = (gen, epoch) => `bus.snapshot.g${gen}.e${epoch}.json`;
+
+// Pipeline file name patterns (constructors live in createBus, where the
+// session id exists): token = pid + '-' + session tag + '-' + nonce, so two
+// processes never collide and a process never reuses a crashed token.
+const QUEUE_RE = /^bus\.q\.(.+)\.json$/;
+const DECISION_RE = /^bus\.c\.(.+)\.json$/;
+const RESULT_RE = /^bus\.r\.(.+)\.json$/;
 
 const sleepSync = (ms) => {
   const slot = new Int32Array(new SharedArrayBuffer(4));
@@ -134,6 +169,35 @@ function parseLog(raw) {
   return { entries, durable: start };
 }
 
+// Read just the first line of the active log as a structural fingerprint.
+// Compaction/truncate always replace that line with a marker, so comparing
+// it detects a rename-based reset even when the filesystem reuses an inode
+// number. Capped at a small prefix: only the head bytes are needed.
+const readHeadSync = (filePath) => {
+  let fd;
+  try {
+    fd = openSync(filePath, 'r');
+  } catch {
+    return null;
+  }
+  try {
+    const buf = Buffer.allocUnsafe(4096);
+    const n = readSync(fd, buf, 0, buf.length, 0);
+    if (!Number.isInteger(n) || n <= 0) return '';
+    const got = buf.subarray(0, n);
+    const nl = got.indexOf(0x0a);
+    return got.subarray(0, nl < 0 ? got.length : nl).toString('utf8');
+  } catch {
+    return null;
+  } finally {
+    try {
+      closeSync(fd);
+    } catch {
+      // Already closed.
+    }
+  }
+};
+
 // Finalized segments present in the directory, oldest first.
 const listSegments = (dir) => {
   const out = [];
@@ -144,6 +208,61 @@ const listSegments = (dir) => {
   out.sort((a, b) => a.index - b.index);
   return out;
 };
+
+/**
+ * Extract the committed, non-stale entries from a raw log buffer, using the
+ * same bracket/fence rules as scanDirectory's recovery walk but without
+ * touching any state: the incremental tail reader applies the result onto
+ * the cached merged view. Returns { units, watermark, closed, structural }:
+ * `closed` is false when the buffer ends inside an uncommitted batch
+ * bracket (a crash mid group), in which case the caller heals with a full
+ * scan; `structural` is set when a truncate/compact marker or a fence was
+ * seen, which also forces a full rescan.
+ */
+function committedUnits(raw, startWatermark) {
+  const units = [];
+  let watermark = startWatermark;
+  let lineStart = 0;
+  let group = null;
+  let structural = false;
+  const stale = (entry) =>
+    entry !== null && typeof entry.g === 'number' && entry.g < watermark;
+  for (let i = 0; i < raw.length; i++) {
+    if (raw[i] !== 0x0a) continue;
+    const entry = i > lineStart ? JSON.parse(raw.toString('utf8', lineStart, i)) : null;
+    if (entry && entry.t === 'f') {
+      if (typeof entry.g === 'number' && entry.g > watermark) watermark = entry.g;
+      structural = true;
+      group = null;
+    } else if (group !== null) {
+      if (stale(entry)) {
+        // A preempted holder's bytes never close or enter the group.
+      } else if (entry && entry.t === 'bk' && entry.id === group.id) {
+        for (const member of group.entries) units.push(member);
+        group = null;
+      } else if (entry && entry.t === 'b') {
+        group = { id: entry.id, entries: [] };
+      } else if (entry) {
+        group.entries.push(entry);
+      }
+    } else if (entry && entry.t === 'b') {
+      if (!stale(entry)) group = { id: entry.id, entries: [] };
+    } else if (entry) {
+      if (entry.t === 't' || entry.t === 'c') {
+        structural = true;
+      } else if (!stale(entry)) {
+        units.push(entry);
+      }
+    }
+    lineStart = i + 1;
+  }
+  // Bytes past the final newline are a torn trailing write (a crash mid
+  // line). They are never parsed; the caller treats them like an open
+  // bracket — heal before appending.
+  const torn = lineStart < raw.length;
+  return { units, watermark, closed: group === null, structural, torn };
+}
+
 
 // First complete line of a log file, or null when there is none.
 const firstEntry = (filePath) => {
@@ -509,6 +628,21 @@ function scanDirectory(dir) {
     if (m.seq > state.horizon) usageBytes += Buffer.byteLength(JSON.stringify(m.record), 'utf8');
   }
 
+  // Identity of the active log as the scan left it. The incremental
+  // catch-up is valid only while the SAME physical file has grown: the
+  // (dev,ino) pair is the cheap check, and the first-line fingerprint is
+  // the portable guard — a compaction reset or a truncation seal always
+  // rewrites the head (a {t:'c'} / {t:'t'} marker), whereas ordinary
+  // appends leave it byte-identical. The head check matters on filesystems
+  // (e.g. WSL drvfs) where rename can preserve an inode number.
+  let activeId = null;
+  try {
+    const stt = statSync(logPath);
+    activeId = { dev: stt.dev, ino: stt.ino, size: stt.size, head: readHeadSync(logPath) };
+  } catch {
+    activeId = { dev: 0, ino: 0, size: 0, head: null };
+  }
+
   return {
     ...state,
     usageBytes,
@@ -522,6 +656,7 @@ function scanDirectory(dir) {
     tails,
     removable,
     reset,
+    activeId,
   };
 }
 
@@ -734,12 +869,6 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
     return changed;
   };
 
-  // Settle a mutation critical section from an already-scanned view: heal
-  // whatever it found, then rescan only when healing actually moved bytes.
-  // This keeps the common case (a healthy directory) to the single scan
-  // withOwnership already performed.
-  const prepareLocked = (st) => (healLocked(st) ? scanDirectory(dir) : st);
-
   // Take the cross-process mutex once, synchronously, for acquisition: the
   // lease decision must itself be serialized against other openers. A lock
   // is broken only when BOTH its directory mtime and the holder's heartbeat
@@ -941,25 +1070,800 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
   // the batch's first acknowledgement just like `pending` does for singles
   const groupPending = new Map();
 
-  const absorb = (st) => {
-    seq = st.seq;
-    bytes = st.bytes;
-    published = st.published;
-    replayed = st.replayed;
-    usageBytes = st.usageBytes;
+  // ---- commit-pipeline state -------------------------------------------
+  // Scan-shaped merged view kept current between full directory scans by
+  // the incremental active-log tail reader. Full scans happen on open,
+  // takeover fences, truncate seals and compaction; ordinary appends only
+  // read newly durable bytes.
+  let view = null;
+  let horizon = 0;
+  let fenceWatermark = 0;
+  // Cursor for the incremental reader: cache is current through byte
+  // offset `off` of active log inode (dev,ino). A seal/compact rename
+  // replaces the inode and forces a full directory scan.
+  let cursor = null;
+  const sessionTag = sessionId.slice(0, 8);
+  // Monotonic per-process counter embedded in each token so queue files
+  // sharing one mtime tick still order by local enqueue sequence.
+  let tokenCounter = 0;
+  const newToken = () =>
+    `${process.pid}-${sessionTag}-${Date.now().toString(36)}-${String(tokenCounter++).padStart(6, '0')}-${Math.random().toString(36).slice(2, 8)}`;
+  const qPath = (token) => path.join(dir, `${QUEUE_PREFIX}${token}.json`);
+  const rPath = (token) => path.join(dir, `${RESULT_PREFIX}${token}.json`);
+  const cPath = (gid) => path.join(dir, `${DECISION_PREFIX}${gid}.json`);
+  const rTmpPath = (token) =>
+    path.join(dir, `bus.r.tmp.${process.pid}.${sessionTag}.${token.slice(-6)}`);
+  const qTmpPath = (token) => path.join(dir, `bus.q.tmp.${token}`);
+  const cTmpPath = (gid) =>
+    path.join(dir, `bus.c.tmp.${process.pid}.${sessionTag}.${gid.slice(0, 8)}`);
+
+  const FENCE_MESSAGE = 'bus write ownership was taken over by another process';
+  const RANGE_MESSAGE_SINGLE = 'publish: retained bytes would exceed maxBytes';
+  const RANGE_MESSAGE_BATCH = 'publishBatch: retained bytes would exceed maxBytes';
+
+  // Copy the scan-shaped view into the scalar/map caches the bus methods
+  // read directly.
+  const syncScalars = () => {
+    seq = view.seq;
+    bytes = view.bytes;
+    published = view.published;
+    replayed = view.replayed;
+    usageBytes = view.usageBytes;
     dedup.clear();
-    for (const [key, value] of st.dedup) dedup.set(key, value);
+    for (const [key, value] of view.dedup) dedup.set(key, value);
     positions.clear();
-    for (const [name, pos] of st.positions) positions.set(name, pos);
+    for (const [name, pos] of view.positions) positions.set(name, pos);
+  };
+
+  // Adopt a full scan as the current cache and rebase the tail cursor on
+  // the active log's post-scan identity.
+  const adoptFullScan = (st) => {
+    view = st;
+    horizon = st.horizon;
+    fenceWatermark = st.fenceEpoch;
+    cursor = {
+      dev: st.activeId.dev,
+      ino: st.activeId.ino,
+      head: st.activeId.head,
+      off: st.activeId.size,
+      watermark: st.fenceEpoch,
+    };
+    syncScalars();
+  };
+
+  // Read a slice [off, end) of a regular file synchronously.
+  const readTail = (file, off, length) => {
+    const buf = Buffer.allocUnsafe(length);
+    const fd = openSync(file, 'r');
+    try {
+      let got = 0;
+      while (got < length) {
+        const n = readSync(fd, buf, got, length - got, off + got);
+        if (!Number.isInteger(n) || n <= 0) break;
+        got += n;
+      }
+      return buf.subarray(0, got);
+    } finally {
+      closeSync(fd);
+    }
+  };
+
+  // Apply committed tail units (m / s / p lines, fence-filtered) to the
+  // view and scalar caches. Only counters and tables are retained on the
+  // hot path — message payloads are NOT cached, so a long-lived writer's
+  // memory does not grow with the log. replay/read/compact read message
+  // contents with a full scan the way the baseline did; the write path
+  // (the cost being removed) never does.
+  const applyUnits = (units) => {
+    for (const entry of units) {
+      if (entry.t === 'm') {
+        if (entry.seq <= horizon) continue;
+        view.seq = entry.seq;
+        view.bytes += entry.bytes;
+        view.usageBytes += entry.bytes;
+        view.published += 1;
+        if (typeof entry.d === 'string') {
+          view.dedup.set(entry.d, { id: entry.id, seq: entry.seq });
+        }
+      } else if (entry.t === 's') {
+        view.replayed += entry.n;
+      } else if (entry.t === 'p') {
+        view.positions.set(entry.name, entry.pos);
+      }
+    }
+    syncScalars();
+  };
+
+  /**
+   * Bring the merged cache current. The common case reads only the bytes
+   * appended to the active log since the last look; a changed inode
+   * (truncate seal / compact reset), a torn or uncommitted tail, or a
+   * structural marker escalates to a full scanDirectory (+ healing when
+   * `mutating`). A mutating catch-up first reconciles decision files and
+   * sweeps queues a crashed drain left behind.
+   */
+  const catchupLocked = ({ mutating }) => {
+    if (mutating) {
+      reconcileLocked();
+      sweepOrphanQueuesLocked();
+    }
+    // Fast path: same device, same inode number, AND an unchanged head
+    // (the portable reset guard for filesystems that reuse inode numbers
+    // across rename), and the file only grew. Anything else is a
+    // structural change → full scan.
+    let info;
+    try {
+      info = statSync(logPath);
+    } catch {
+      info = { dev: 0, ino: 0, size: 0 };
+    }
+    if (
+      view &&
+      cursor &&
+      cursor.dev === info.dev &&
+      cursor.ino === info.ino &&
+      info.size >= cursor.off
+    ) {
+      const headNow = info.size > 0 ? readHeadSync(logPath) : '';
+      if (headNow === cursor.head) {
+        if (info.size === cursor.off) return;
+        const raw = readTail(logPath, cursor.off, info.size - cursor.off);
+        const parsed = committedUnits(raw, cursor.watermark);
+        if (parsed.closed && !parsed.structural && !parsed.torn) {
+          applyUnits(parsed.units);
+          cursor.off = info.size;
+          cursor.watermark = parsed.watermark;
+          fenceWatermark = Math.max(fenceWatermark, parsed.watermark);
+          view.fenceEpoch = fenceWatermark;
+          return;
+        }
+      }
+      if (!mutating) {
+        // Open bracket / torn tail / marker: read-only callers observe the
+        // authoritative scan but must not heal anything.
+        adoptFullScan(scanDirectory(dir));
+        return;
+      }
+      // Fall through to the healing full scan below.
+    }
+    if (mutating) {
+      let st = scanDirectory(dir);
+      if (healLocked(st)) st = scanDirectory(dir);
+      adoptFullScan(st);
+    } else {
+      adoptFullScan(scanDirectory(dir));
+    }
+  };
+
+  // Stage one publish/publishBatch request into the lock-free queue. The
+  // file is durable before the mutex is taken, so whichever process drains
+  // next observes the request even if the staging process never gets the
+  // lock itself.
+  const stageRequest = (token, kind, items) => {
+    const payload = JSON.stringify({
+      v: 1,
+      e: epoch,
+      s: sessionId,
+      k: kind,
+      items: items.map((it) => {
+        const part = { j: it.recordJson, z: it.size };
+        if (it.dedupKey !== undefined) part.d = it.dedupKey;
+        return part;
+      }),
+    });
+    const tmp = qTmpPath(token);
+    const fd = openSync(tmp, 'w');
+    try {
+      writeSync(fd, Buffer.from(payload, 'utf8'));
+      if (fsync) fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(tmp, qPath(token));
+  };
+
+  const writeOutcomeLocked = (token, result) => {
+    try {
+      const tmp = rTmpPath(token);
+      const fd = openSync(tmp, 'w');
+      try {
+        writeSync(fd, Buffer.from(JSON.stringify({ v: 1, result }), 'utf8'));
+        if (fsync) fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+      renameSync(tmp, rPath(token));
+      return true;
+    } catch {
+      // The decision + visible commit remain the source of truth: a
+      // missing outcome is re-synthesised by the next reconcile, which
+      // runs before any drain gathers the still-present queue.
+      return false;
+    }
+  };
+
+  const readOutcome = (token) => {
+    try {
+      return JSON.parse(readFileSync(rPath(token), 'utf8')).result;
+    } catch {
+      return null;
+    }
+  };
+
+  // Search the ordered log for a commit bracket a recovery walk would
+  // actually apply: a matching bk that is complete and not stamped below
+  // the fence watermark in effect at its physical position. A bk a
+  // preempted holder landed after a takeover fence is invisible and must
+  // not settle its tokens as success; one committed before the fence is
+  // legitimate history even when the decision's epoch is older.
+  const committedGroupVisible = (gid) => {
+    const files = listSegments(dir).map((s) => s.path);
+    if (existsSync(logPath)) files.push(logPath);
+    let wm = 0;
+    let openId = null;
+    for (const file of files) {
+      let raw;
+      try {
+        raw = readFileSync(file);
+      } catch {
+        continue;
+      }
+      let lineStart = 0;
+      for (let i = 0; i < raw.length; i++) {
+        if (raw[i] !== 0x0a) continue;
+        let entry = null;
+        if (i > lineStart) {
+          try {
+            entry = JSON.parse(raw.toString('utf8', lineStart, i));
+          } catch {
+            entry = null;
+          }
+        }
+        const stale =
+          entry !== null && typeof entry.g === 'number' && entry.g < wm;
+        if (entry && entry.t === 'f') {
+          if (typeof entry.g === 'number' && entry.g > wm) wm = entry.g;
+          openId = null;
+        } else if (openId !== null) {
+          if (!stale && entry && entry.t === 'bk' && entry.id === openId) {
+            if (openId === gid) return true;
+            openId = null;
+          } else if (!stale && entry && entry.t === 'b') {
+            openId = entry.id;
+          }
+        } else if (entry && entry.t === 'b' && !stale) {
+          openId = entry.id;
+        }
+        lineStart = i + 1;
+      }
+    }
+    return false;
+  };
+
+  /**
+   * Reconcile decision files a crashed drain left behind:
+ *  - a committed, visible group: every per-token outcome promised by the
+ *    decision is (re)synthesised and its queue removed; every requester
+ *    (across processes or after restart) adopts exactly that first ack.
+ *  - anything else: the decision is discarded. A same-epoch partial group
+ *    is severed by the caller's healing scan; a fenced group's bytes are
+ *    filtered by the watermark and never mix in.
+   */
+  const reconcileLocked = () => {
+    let names = [];
+    try {
+      names = readdirSync(dir);
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      const m = DECISION_RE.exec(name);
+      if (!m) continue;
+      const gid = m[1];
+      let decision;
+      try {
+        decision = JSON.parse(readFileSync(path.join(dir, name), 'utf8'));
+      } catch {
+        // Half-written decision file: it cannot have led to a commit.
+        try {
+          rmSync(path.join(dir, name), { force: true });
+        } catch {
+          // Removed concurrently.
+        }
+        continue;
+      }
+      if (committedGroupVisible(gid)) {
+        for (const part of decision.results || []) {
+          writeOutcomeLocked(part.token, part.result);
+          try {
+            rmSync(qPath(part.token), { force: true });
+          } catch {
+            // Already gone: the requester's adopt path settles it.
+          }
+        }
+      }
+      // Spent once the visible-commit outcomes are settled. An uncommitted
+      // group's bytes are healed/fenced by the catch-up that follows.
+      try {
+        rmSync(path.join(dir, name), { force: true });
+      } catch {
+        // Another drain removed it.
+      }
+    }
+  };
+
+  // Reap queue files a crashed/frozen caller left behind, plus outcome
+  // files that can never be consumed: a queue whose requester heartbeat is
+  // stale belongs to a dead process (its token outcome, if one exists, goes
+  // with it), and any older-than-lease outcome file is garbage because
+  // outcomes are adopted within milliseconds of being written.
+  const sweepOrphanQueuesLocked = () => {
+    const now = Date.now();
+    let names = [];
+    try {
+      names = readdirSync(dir);
+    } catch {
+      return;
+    }
+    const staleResults = new Set();
+    for (const name of names) {
+      const qm = QUEUE_RE.exec(name);
+      if (qm) {
+        const token = qm[1];
+        let req = null;
+        try {
+          req = JSON.parse(readFileSync(path.join(dir, name), 'utf8'));
+        } catch {
+          req = null;
+        }
+        const dead = !req || typeof req.s !== 'string' || !heartbeatAlive(req.s);
+        if (readOutcome(token) !== null || dead) {
+          if (dead) staleResults.add(token);
+          try {
+            rmSync(path.join(dir, name), { force: true });
+          } catch {
+            // Concurrent cleanup.
+          }
+        }
+      } else if (RESULT_RE.test(name)) {
+        let age = Infinity;
+        try {
+          age = now - statSync(path.join(dir, name)).mtimeMs;
+        } catch {
+          age = Infinity;
+        }
+        if (age > LEASE_MS) staleResults.add(RESULT_RE.exec(name)[1]);
+      }
+    }
+    for (const token of staleResults) {
+      try {
+        rmSync(rPath(token), { force: true });
+      } catch {
+        // Already gone.
+      }
+    }
+  };
+
+  /**
+   * The drain: merge every staged live request in the directory into one
+   * bracketed commit group. The plan (continuous seqs, first-occurrence
+   * dedup across requests and history, per-item quota, four cumulative
+   * counters) is shaped once, persisted as a decision, flushed in one
+   * chunked write, and only then exposed via per-token outcome files.
+   * Returns the caller's own result object.
+   */
+  const drainLocked = (lease, ownToken) => {
+    const fenceResult = { ok: false, ctor: 'Error', message: FENCE_MESSAGE };
+
+    // Test seam: hold the lock at the drain entrance (heartbeat fresh) so
+    // requests other processes stage during the wait deterministically
+    // merge into this same group.
+    const drainDelay = seamNumber('BUS_DRAIN_DELAY_MS');
+    if (drainDelay > 0) {
+      const slot = new Int32Array(new SharedArrayBuffer(4));
+      const waited = Date.now();
+      while (Date.now() - waited < drainDelay) {
+        writeHeartbeat();
+        Atomics.wait(slot, 0, 0, Math.min(20, drainDelay));
+      }
+    }
+
+    // Gather staged requests oldest first; mtime is the cross-process
+    // enqueue order, the token is a deterministic tie-breaker.
+    const files = [];
+    for (const name of readdirSync(dir)) {
+      const m = QUEUE_RE.exec(name);
+      if (!m) continue;
+      let mt = 0;
+      try {
+        mt = statSync(path.join(dir, name)).mtimeMs;
+      } catch {
+        mt = 0;
+      }
+      files.push({ name, token: m[1], mt });
+    }
+    files.sort((a, b) => (a.mt !== b.mt ? a.mt - b.mt : a.token < b.token ? -1 : 1));
+
+    const requests = [];
+    for (const f of files) {
+      let req = null;
+      try {
+        req = JSON.parse(readFileSync(path.join(dir, f.name), 'utf8'));
+      } catch {
+        req = null;
+      }
+      // A token carrying an outcome is already settled; drop the leftover.
+      const settled = readOutcome(f.token);
+      if (settled !== null) {
+        try {
+          rmSync(path.join(dir, f.name), { force: true });
+        } catch {
+          // Concurrent cleanup.
+        }
+        continue;
+      }
+      if (!req || !Array.isArray(req.items) || typeof req.s !== 'string') {
+        // Corrupt/half queue file (never expected: staging is atomic): take
+        // no byte from it and remove.
+        try {
+          rmSync(path.join(dir, f.name), { force: true });
+        } catch {
+          // Already gone.
+        }
+        continue;
+      }
+      if (!heartbeatAlive(req.s)) {
+        // Dead requester: orphaned intent, never drained.
+        try {
+          rmSync(path.join(dir, f.name), { force: true });
+        } catch {
+          // Already gone.
+        }
+        continue;
+      }
+      // Epoch barrier at the pipeline boundary: a request a preempted
+      // holder queued before losing ownership fails wholesale and no byte
+      // of it mixes into the group.
+      if (typeof req.e !== 'number' || req.e !== lease.epoch) {
+        requests.push({ token: f.token, stale: true });
+        continue;
+      }
+      requests.push({ token: f.token, kind: req.k === 'batch' ? 'batch' : 'single', items: req.items });
+    }
+
+    // Plan the merged group. Each request is resolved as a whole against
+    // the running merged plan; a request that over quota contributes
+    // nothing (no seq, no key registration, no line) and gets a RangeError
+    // while earlier and later requests proceed untouched.
+    const gid = randomUUID();
+    // Running merged plan, mutated only by accepted requests.
+    let nextSeq = seq;
+    let groupBytes = 0;
+    let groupCount = 0;
+    // Keys whose first ack is allocated inside THIS group, shared across
+    // every request merged into it.
+    const fresh = new Map();
+    const lineBuffers = [];
+    const results = [];
+
+    for (const req of requests) {
+      if (req.stale) {
+        results.push({ token: req.token, result: fenceResult });
+        continue;
+      }
+      // Scratch state for this request alone; merged into the group plan
+      // only when every item resolves and the quota fits.
+      const acks = [];
+      const owned = new Map();
+      const plannedLines = [];
+      let addBytes = 0;
+      let addCount = 0;
+      let trialSeq = nextSeq;
+      let rejected = null;
+      for (const item of req.items) {
+        const size =
+          typeof item.z === 'number' ? item.z : Buffer.byteLength(item.j, 'utf8');
+        const key = typeof item.d === 'string' ? item.d : undefined;
+        let hit = null;
+        if (key !== undefined) {
+          hit = dedup.get(key) || fresh.get(key) || owned.get(key) || null;
+        }
+        if (hit) {
+          acks.push({ id: hit.id, seq: hit.seq });
+          continue;
+        }
+        // Per-item occupancy against the merged usage plus the bytes every
+        // already-accepted request of this group adds. One byte over
+        // rejects the single record or the whole batch with the group
+        // plan exactly as it was.
+        if (quota !== undefined && usageBytes + groupBytes + addBytes + size > quota) {
+          rejected =
+            req.kind === 'batch'
+              ? { ok: false, ctor: 'RangeError', message: RANGE_MESSAGE_BATCH }
+              : { ok: false, ctor: 'RangeError', message: RANGE_MESSAGE_SINGLE };
+          break;
+        }
+        trialSeq += 1;
+        const id = randomUUID();
+        const ack = { id, seq: trialSeq };
+        acks.push(ack);
+        if (key !== undefined) owned.set(key, ack);
+        let line = `{"t":"m","seq":${trialSeq},"id":${JSON.stringify(id)},"bytes":${size},"g":${lease.epoch}`;
+        if (key !== undefined) line += `,"d":${JSON.stringify(key)}`;
+        line += `,"record":${item.j}}\n`;
+        plannedLines.push(Buffer.from(line, 'utf8'));
+        addBytes += size;
+        addCount += 1;
+      }
+      if (rejected) {
+        // Nothing of this request enters the merged plan: scratch is simply
+        // discarded and nextSeq/groupBytes stay at the previous request's
+        // values, so seqs assigned to later requests have no hole.
+        results.push({ token: req.token, result: rejected });
+      } else {
+        lineBuffers.push(...plannedLines);
+        groupBytes += addBytes;
+        groupCount += addCount;
+        nextSeq = trialSeq;
+        for (const [key, ack] of owned) fresh.set(key, ack);
+        results.push({
+          token: req.token,
+          result:
+            req.kind === 'batch' ? { ok: true, acks } : { ok: true, ack: acks[0] },
+        });
+      }
+    }
+
+    // If nothing effective survived (all rejects/duplicates-only groups
+    // with... duplicates alone also produce no lines), expose outcomes
+    // directly without opening a bracket.
+    if (groupCount === 0) {
+      for (const r of results) {
+        writeOutcomeLocked(r.token, r.result);
+        try {
+          rmSync(qPath(r.token), { force: true });
+        } catch {
+          // Already drained/removed.
+        }
+      }
+      const own = results.find((r) => r.token === ownToken);
+      return own ? own.result : null;
+    }
+
+    // Persist the decision before a single group byte moves: on a torn
+    // flush a reopen reconcile knows exactly which tokens the group owed,
+    // and whether the commit line made it decides all-or-nothing.
+    const decision = { v: 1, id: gid, e: lease.epoch, results };
+    {
+      const tmp = cTmpPath(gid);
+      const fd = openSync(tmp, 'w');
+      try {
+        writeSync(fd, Buffer.from(JSON.stringify(decision), 'utf8'));
+        if (fsync) fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+      renameSync(tmp, cPath(gid));
+      if (fsync) syncDirBestEffort();
+    }
+    // Boundary check: the group is planned but no byte is written yet.
+    reassertLocked();
+
+    const head = Buffer.from(JSON.stringify({ t: 'b', id: gid, g: lease.epoch }) + '\n', 'utf8');
+    const tail = Buffer.from(JSON.stringify({ t: 'bk', id: gid, g: lease.epoch }) + '\n', 'utf8');
+
+    // Byte offset the log must return to if the flush fails: a write or
+    // fsync failure rolls the whole group back physically, leaving the bus
+    // byte-for-byte as it was before the bracket.
+    let startOffset = 0;
+    try {
+      startOffset = statSync(logPath).size;
+    } catch {
+      startOffset = 0;
+    }
+
+    const fd = openSync(logPath, 'a');
+    let bkWritten = false;
+    let wrote = 0;
+    let flushError = null;
+    try {
+      const writeAll = (buf) => {
+        let off = 0;
+        while (off < buf.length) {
+          const n = writeSync(fd, buf, off, buf.length - off);
+          if (!Number.isInteger(n) || n <= 0) {
+            throw new Error('commit: write made no progress, group is not durable');
+          }
+          off += n;
+        }
+      };
+      writeAll(head);
+      wrote += head.length;
+      // Long groups flush in chunks; the heartbeat and the epoch credential
+      // are re-validated at every chunk boundary, so a holder seized
+      // mid-group stops before the commit line and its partial group is
+      // wholly invisible.
+      const CHUNK = 256;
+      for (let i = 0; i < lineBuffers.length; i += CHUNK) {
+        writeHeartbeat();
+        reassertLocked();
+        const part = Buffer.concat(lineBuffers.slice(i, i + CHUNK));
+        writeAll(part);
+        wrote += part.length;
+        // Seam: inject a disk-write failure once this many group bytes are
+        // down, exercising whole-group rollback and torn-tail healing.
+        if (seamNumber('BUS_FLUSH_FAIL_AT') > 0 && wrote - head.length >= seamNumber('BUS_FLUSH_FAIL_AT')) {
+          throw new Error('injected flush failure');
+        }
+        // Seam: after the first chunk block WITHOUT refreshing the
+        // heartbeat, exactly as a process seized mid group would; the next
+        // boundary check observes the takeover and the partial bracket
+        // (no commit line) stays wholly invisible behind the fence.
+        const stall = seamNumber('BUS_DRAIN_STALL_MS');
+        if (stall > 0 && i === 0) {
+          sleepSync(stall);
+          reassertLocked();
+        }
+      }
+      writeHeartbeat();
+      reassertLocked();
+      writeAll(tail);
+      wrote += tail.length;
+      bkWritten = true;
+      // A flush (fsync) failure is a write failure: the group must roll
+      // back wholesale rather than be acknowledged un-durably.
+      if (fsync) fsyncSync(fd);
+    } catch (err) {
+      flushError = err;
+    }
+    try {
+      closeSync(fd);
+    } catch {
+      // Already closed.
+    }
+
+    if (flushError !== null) {
+      const wasFence =
+        fenced ||
+        (flushError && /taken over|invalidated/.test(String(flushError.message)));
+      if (!wasFence) {
+        // Disk write/fsync failure: sever the group physically so the log
+        // is exactly what it was before the bracket, then settle every
+        // token of the group with the failure and burn the decision. The
+        // instance is broken: nothing else may append until reopen heals.
+        try {
+          truncateSync(logPath, startOffset);
+        } catch {
+          // The truncate failed too; the uncommitted bracket is severed by
+          // the next lock holder's healing scan / reopen.
+        }
+        const failResult = {
+          ok: false,
+          ctor: 'Error',
+          message: flushError.message || 'commit failed',
+        };
+        for (const r of results) {
+          writeOutcomeLocked(r.token, failResult);
+          try {
+            rmSync(qPath(r.token), { force: true });
+          } catch {
+            // Leftover: the outcome settles it regardless.
+          }
+        }
+        try {
+          rmSync(cPath(gid), { force: true });
+        } catch {
+          // Already removed.
+        }
+        broken = true;
+        cursor = null;
+        throw flushError;
+      }
+      // Fenced mid-flush: the partial bytes are stamped with the stale
+      // epoch and stay physically in place exactly as a preempted
+      // holder's racy append would — the fence watermark filters them from
+      // every reader. The queued group as a whole fails; burn its decision
+      // so no token can settle as success.
+      for (const r of results) {
+        writeOutcomeLocked(r.token, fenceResult);
+        try {
+          rmSync(qPath(r.token), { force: true });
+        } catch {
+          // Leftover: the outcome settles it regardless.
+        }
+      }
+      try {
+        rmSync(cPath(gid), { force: true });
+      } catch {
+        // Already removed.
+      }
+      fenced = true;
+      cursor = null;
+      throw flushError;
+    }
+
+    // Final boundary check once the flush is durable. A takeover observed
+    // only after the commit line landed cannot un-write the group (it is
+    // legitimate history before any later fence), so settle the success
+    // outcomes first; this instance is still fenced for every later op.
+    let postFence = null;
+    try {
+      reassertLocked();
+    } catch (err) {
+      postFence = err;
+    }
+
+    // Durable first, state after: advance the merged view by exactly the
+    // planned group.
+    view.seq = nextSeq;
+    view.bytes += groupBytes;
+    view.usageBytes += groupBytes;
+    view.published += groupCount;
+    for (const [key, ack] of fresh) view.dedup.set(key, { id: ack.id, seq: ack.seq });
+    syncScalars();
+    if (cursor) {
+      cursor.off += wrote;
+      cursor.watermark = Math.max(cursor.watermark, fenceWatermark);
+    } else {
+      try {
+        const info = statSync(logPath);
+        cursor = {
+          dev: info.dev,
+          ino: info.ino,
+          head: info.size > 0 ? readHeadSync(logPath) : '',
+          off: info.size,
+          watermark: fenceWatermark,
+        };
+      } catch {
+        cursor = null;
+      }
+    }
+
+    // Expose outcomes (durable), then retire each queue whose outcome
+    // landed. A token whose outcome write failed keeps BOTH its queue and
+    // the decision, so the very next reconcile (same token's adopt retry
+    // or another opener) re-synthesises the same result from the visible
+    // commit — never a false failure or a second publish.
+    let allSettled = true;
+    for (const r of results) {
+      if (writeOutcomeLocked(r.token, r.result)) {
+        try {
+          rmSync(qPath(r.token), { force: true });
+        } catch {
+          // Leftover: the outcome settles it on the next sweep.
+        }
+      } else {
+        allSettled = false;
+      }
+    }
+    if (allSettled) {
+      try {
+        rmSync(cPath(gid), { force: true });
+      } catch {
+        // Another reconcile path removed it.
+      }
+    }
+    syncDirBestEffort();
+
+    if (postFence) throw postFence;
+
+    // The caller's result is known in-memory regardless of whether its
+    // outcome file landed; the durable handoff above guarantees every
+    // OTHER requester adopts the identical result.
+    const own = results.find((r) => r.token === ownToken);
+    return own ? own.result : null;
   };
 
   // Prime the cache from the shared directory before createBus returns, so
-  // stats() is correct immediately (single-process behaviour).
+  // stats() is correct immediately (single-process behaviour). This is a
+  // mutating (but append-free) catch-up under the lock: it reconcles any
+  // decision a crashed drain left behind, reaps dead sessions' queues,
+  // heals torn/uncommitted tails and then adopts the merged view.
   try {
-    withLockSync(() => absorb(scanDirectory(dir)), VIEW_WAIT_MS * 10);
+    withLockSync(() => catchupLocked({ mutating: true }), VIEW_WAIT_MS * 10);
   } catch {
-    // Another writer holds the lock for long: cache stays zero and the
-    // first operation rescans under the lock.
+    // Another writer holds the lock for long: cache stays empty and the
+    // first operation catches up under the lock.
   }
 
   let chain = Promise.resolve();
@@ -1015,11 +1919,11 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
     }
   };
 
-  // Run `fn(lease, scanView)` under the cross-process lock with a valid
-  // credential. The scan passed in is the current merged directory state.
-  // Read-only callers (an existing position lookup) never assert the
-  // credential, so a fenced instance can still read the shared files; they
-  // must not mutate anything themselves.
+  // Run `fn(lease, view)` under the cross-process lock with a valid
+  // credential. `view` is the merged directory state kept current by the
+  // incremental tail reader (a full scan happens only on structural
+  // change). Read-only callers (position lookups) never assert the
+  // credential and never heal, so a fenced instance can still read.
   const withOwnership = (fn, { waitMs = LOCK_WAIT_MS, readonly = false } = {}) =>
     withLockSync(() => {
       if (closed || broken) {
@@ -1033,8 +1937,143 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
         // refresh again between fsyncs.
         writeHeartbeat();
       }
-      return fn(lease, scanDirectory(dir));
+      catchupLocked({ mutating: !readonly });
+      return fn(lease, view);
     }, waitMs);
+
+  // Bring the incremental cursor forward after a direct append the drain
+  // did not perform (a replay/position line). A structural replacement
+  // cannot happen while this instance holds the lock, so the inode is the
+  // same; anything unexpected invalidates the cursor and forces a rescan.
+  const noteAppended = (byteCount) => {
+    if (!cursor) return;
+    try {
+      const info = statSync(logPath);
+      if (info.dev === cursor.dev && info.ino === cursor.ino && info.size >= cursor.off) {
+        cursor.off = Math.max(cursor.off + byteCount, info.size);
+      } else {
+        cursor = null;
+      }
+    } catch {
+      cursor = null;
+    }
+  };
+
+  /**
+   * Run one publish ('single') or publishBatch ('batch') request through
+   * the grouped commit pipeline:
+   *   1. stage the validated, serialized items into the lock-free queue;
+   *   2. take the mutex, catch up the merged view and drain ALL staged
+   *      requests (this process's and every other live writer's) as one
+   *      bracketed commit group;
+   *   3. read back this token's outcome — which the drain itself or an
+   *      earlier reconcile produced — and return acks or rethrow the exact
+   *      rejection.
+   * A request is staged durably before the lock, so even if this process
+   *  is the one displaced waiting for the mutex, its queued group simply
+   * fails as a whole at the epoch boundary; its bytes never mix in.
+   */
+  const commitThroughPipeline = (kind, items) => {
+    const token = newToken();
+    stageRequest(token, kind, items);
+    let outcome = null;
+    let lastErr = null;
+    // A contended mutex is retried with the SAME token: staging is
+    // idempotent under one token, so an attempt another drain settled and
+    // an attempt we drain ourselves can never both publish. Bounded so a
+    // wedged lock still rejects the call rather than hanging forever.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        withOwnership((lease) => {
+          outcome = drainLocked(lease, token);
+        });
+        lastErr = null;
+        break;
+      } catch (err) {
+        const settled = readOutcome(token);
+        if (settled !== null) {
+          outcome = settled;
+          lastErr = null;
+          break;
+        }
+        if (!isLockError(err)) {
+          // Fence/closed/disk failure: a failed flush already truncated
+          // and settled every token (or this token never entered a group);
+          // withdraw it so it cannot be drained afterwards.
+          cleanupStaged(token, true);
+          throw err;
+        }
+        lastErr = err;
+      }
+    }
+    if (lastErr !== null) {
+      // Mutex never became available. Decide atomically under the lock:
+      // another drain is either already done (outcome present → adopt) or
+      // has not gathered this token yet (withdraw it). Holding the mutex
+      // makes those the only two cases, so the caller can never see an
+      // error while its bytes later commit.
+      try {
+        withLockSync(() => {
+          // Settle any decision a crashed drain left behind FIRST: if that
+          // commit covered this token, reconcile writes its outcome and we
+          // adopt rather than withdraw.
+          reconcileLocked();
+          const settled = readOutcome(token);
+          if (settled !== null) {
+            outcome = settled;
+          } else {
+            try {
+              rmSync(qPath(token), { force: true });
+            } catch {
+              // Best effort; the next sweep reaps it via liveness/close.
+            }
+          }
+        }, LOCK_WAIT_MS);
+      } catch {
+        // Even the finalizing lock failed: leave the staged request in
+        // place (the caller got a contention error). Its heartbeat keeps
+        // it alive for one more attempt; if this process gives up, the
+        // orphan sweep reaps it once the session goes stale.
+        throw lastErr;
+      }
+      if (outcome === null) throw lastErr;
+    }
+    if (outcome === null || outcome === undefined) {
+      outcome = readOutcome(token);
+    }
+    if (outcome === null || outcome === undefined) {
+      cleanupStaged(token, true);
+      throw new Error('commit group was not drained');
+    }
+    // The token is settled: its queue/outcome are this token's private
+    // leftovers (another process only ever read them), so remove both.
+    cleanupStaged(token, true);
+    if (outcome.ok) {
+      return kind === 'batch' ? outcome.acks : outcome.ack;
+    }
+    if (outcome.ctor === 'RangeError') throw new RangeError(outcome.message);
+    throw new Error(outcome.message || FENCE_MESSAGE);
+  };
+
+  // Remove a token's queue/outcome leftovers after its result is known.
+  // With removeOutcome set (failure paths that never want this token
+  // drained again) the outcome is removed too; otherwise it stays only
+  // until the drain's own cleanup (it is idempotent and tiny).
+  const cleanupStaged = (token, removeOutcome) => {
+    try {
+      rmSync(qPath(token), { force: true });
+    } catch {
+      // Best effort.
+    }
+    if (removeOutcome) {
+      try {
+        rmSync(rPath(token), { force: true });
+      } catch {
+        // Best effort.
+      }
+    }
+  };
+
 
   // Re-verify ownership at a multi-phase boundary while still holding the
   // lock. A holder keeps its heartbeat fresh even inside long synchronous
@@ -1085,10 +2124,6 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
     }
   };
 
-  const writeEntry = (entry, wantFsync = fsync) => {
-    appendTo(logPath, Buffer.from(JSON.stringify(entry) + '\n', 'utf8'), wantFsync);
-  };
-
   // A failure to even take the mutex is contention, not a torn write: the
   // instance stays usable and the call may be retried. Only a failure after
   // the lock is held (an actual disk write) makes the bus `broken`.
@@ -1100,12 +2135,13 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
   // credential, and the merged position map comes from the shared files.
   const persistPosition = (name, pos) => {
     try {
-      withOwnership((lease, scanned) => {
-        const st = prepareLocked(scanned);
-        writeEntry({ t: 'p', name, pos, g: epoch });
-        // Reflect locally without requiring a full rescan.
-        st.positions.set(name, pos);
-        absorb(st);
+      withOwnership(() => {
+        const line = JSON.stringify({ t: 'p', name, pos, g: epoch }) + '\n';
+        appendTo(logPath, Buffer.from(line, 'utf8'), fsync);
+        // Reflect locally on the cached view without a full rescan.
+        view.positions.set(name, pos);
+        syncScalars();
+        noteAppended(Buffer.byteLength(line, 'utf8'));
       });
     } catch (err) {
       if (!fenced && !isLockError(err)) broken = true;
@@ -1141,7 +2177,10 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
 
   const bestEffortView = () => {
     try {
-      withLockSync(() => absorb(scanDirectory(dir)), VIEW_WAIT_MS);
+      withLockSync(() => {
+        // Read-only adoption of the merged view; never heal here.
+        catchupLocked({ mutating: false });
+      }, VIEW_WAIT_MS);
     } catch {
       // Lock held by a writer right now: the cached view stays valid.
     }
@@ -1165,6 +2204,7 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
         return Promise.reject(err);
       }
       const size = Buffer.byteLength(JSON.stringify(record), 'utf8');
+      const recordJson = JSON.stringify(record);
 
       // Duplicate of an effective message seen by this instance (possibly
       // recovered from disk). Keys first published by another process miss
@@ -1201,59 +2241,16 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
         if (closed || broken) {
           throw new Error('bus is closed');
         }
-        return withOwnership((lease, st0) => {
-          const st = prepareLocked(st0);
-
-          // The key may have landed from another process (or another
-          // session of this one) between the cache check and the lock:
-          // share that first acknowledgement byte-for-byte.
-          if (dedupKey !== undefined) {
-            const shared = st.dedup.get(dedupKey);
-            if (shared) {
-              dedup.set(dedupKey, { id: shared.id, seq: shared.seq });
-              absorb(st);
-              return { id: shared.id, seq: shared.seq, reused: true };
-            }
-          }
-
-          // Quota is judged inside the lock against the merged occupancy,
-          // so bytes another process committed count. An exact fit
-          // succeeds; one byte over (or one oversized record) rejects
-          // before anything is written — shared state stays untouched.
-          if (quota !== undefined && st.usageBytes + size > quota) {
-            absorb(st);
-            throw new RangeError('publish: retained bytes would exceed maxBytes');
-          }
-          const mySeq = st.seq + 1;
-          const id = randomUUID();
-          const entry = { t: 'm', seq: mySeq, id, bytes: size, g: epoch, record };
-          if (dedupKey !== undefined) entry.d = dedupKey;
-          try {
-            // Durable before acknowledgement: state changes only after the
-            // write (and optional fsync) succeeds.
-            appendTo(
-              logPath,
-              Buffer.from(JSON.stringify(entry) + '\n', 'utf8'),
-              fsync,
-            );
-          } catch (err) {
-            broken = true;
-            throw err;
-          }
-          // Defense in depth: confirm the credential still holds after the
-          // write completes. A live job's heartbeat cannot go stale, so this
-          // only trips under tampering; on the rare race the caller sees a
-          // rejection and the stamped line is filtered by the fence anyway.
-          reassertLocked();
-          // Apply to the merged view and cache it.
-          st.seq = mySeq;
-          st.bytes += size;
-          st.usageBytes += size;
-          st.published += 1;
-          if (dedupKey !== undefined) st.dedup.set(dedupKey, { id, seq: mySeq });
-          absorb(st);
-          return { id, seq: mySeq, reused: false };
-        });
+        // The merged commit pipeline: staged lock-free, then this lock
+        // holder drains every staged request (across processes) into one
+        // bracketed group and returns this token's exact outcome. A key
+        // another process committed between the cache check and the drain
+        // is a reuse result from the merged plan, handled uniformly here.
+        return commitThroughPipeline('single', [
+          dedupKey === undefined
+            ? { recordJson, size }
+            : { dedupKey, recordJson, size },
+        ]);
       }).then(
         (ack) => {
           const clean = { id: ack.id, seq: ack.seq };
@@ -1340,149 +2337,44 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
         if (closed || broken) {
           throw new Error('bus is closed');
         }
-        return withOwnership((lease, st0) => {
-          const st = prepareLocked(st0);
-
-          // Resolve the whole plan against the merged durable state inside
-          // the locked job, so groups queued behind any writer's publishes
-          // observe committed dedup keys from every process.
-          const gid = randomUUID();
-          let nextSeq = st.seq;
-          let effectiveBytes = 0;
-          const owned = new Map(); // key -> first acknowledgement within group
-          const keyAcks = new Map(); // every dedup key's resolved acknowledgement
-          const planned = prepared.map((item) => {
-            const key = item.dedupKey;
-            if (key !== undefined) {
-              const hist = st.dedup.get(key);
-              if (hist) {
-                const reuse = { id: hist.id, seq: hist.seq };
-                keyAcks.set(key, reuse);
-                return { reuse };
-              }
-              const earlier = owned.get(key);
-              if (earlier) {
-                return { reuse: earlier };
-              }
-            }
-            nextSeq += 1;
-            const id = randomUUID();
-            const ack = { id, seq: nextSeq };
-            if (key !== undefined) {
-              owned.set(key, ack);
-              keyAcks.set(key, ack);
-            }
-            // Splice the already-serialized record into the line so the
-            // persisted bytes are exactly what `size` counted.
-            let line = `{"t":"m","seq":${nextSeq},"id":${JSON.stringify(id)},"bytes":${item.size},"g":${epoch}`;
-            if (key !== undefined) line += `,"d":${JSON.stringify(key)}`;
-            line += `,"record":${item.recordJson}}\n`;
-            effectiveBytes += item.size;
-            return { effective: { ack, line, size: item.size, key } };
-          });
-
-          // Shape validation happened at call time; quota is judged for the
-          // whole group here against merged occupancy, counting only the
-          // first occurrence of each key. One byte over rejects the entire
-          // group before the bracket is opened — no seq, stat or file change
-          // anywhere in the shared directory.
-          if (quota !== undefined && st.usageBytes + effectiveBytes > quota) {
-            absorb(st);
-            throw new RangeError('publishBatch: retained bytes would exceed maxBytes');
+        // One staged request for the whole batch; the drain merges it with
+        // every other staged request (singles and batches, this process
+        // and others) into a single commit group and judges this batch's
+        // occupancy as a whole against the merged plan.
+        return commitThroughPipeline(
+          'batch',
+          prepared.map((item) =>
+            item.dedupKey === undefined
+              ? { recordJson: item.recordJson, size: item.size }
+              : { dedupKey: item.dedupKey, recordJson: item.recordJson, size: item.size },
+          ),
+        );
+      }).then(
+        (acks) => {
+          // Resolve racers that attached to this group's first-occurrence
+          // keys with the acks the merged group actually assigned.
+          const keyFirst = new Map();
+          for (let i = 0; i < prepared.length; i++) {
+            const key = prepared[i].dedupKey;
+            if (key !== undefined && !keyFirst.has(key)) keyFirst.set(key, acks[i]);
           }
-
-          // One begin-bracket, the group's new messages, one commit-bracket.
-          // Recovery applies the bracketed entries only when the commit is
-          // present, so a crash leaves no trace of the group.
-          const buffers = [
-            Buffer.from(JSON.stringify({ t: 'b', id: gid, g: epoch }) + '\n', 'utf8'),
-          ];
-          for (const part of planned) {
-            if (part.effective) {
-              buffers.push(Buffer.from(part.effective.line, 'utf8'));
-            }
-          }
-          buffers.push(
-            Buffer.from(JSON.stringify({ t: 'bk', id: gid, g: epoch }) + '\n', 'utf8'),
-          );
-
-          // Everything is written through one append handle, synchronously,
-          // while the cross-process lock is held: no position line or other
-          // writer can interleave. Single-buffer writeSync in chunks behaves
-          // identically on Windows.
-          const fd = openSync(logPath, 'a');
-          try {
-            const writeBuffer = (buf) => {
-              let off = 0;
-              while (off < buf.length) {
-                const written = writeSync(fd, buf, off, buf.length - off);
-                if (!Number.isInteger(written) || written <= 0) {
-                  throw new Error('publishBatch: write made no progress, group is not durable');
-                }
-                off += written;
-              }
-            };
-            const CHUNK = 256;
-            for (let i = 0; i < buffers.length; i += CHUNK) {
-              writeBuffer(Buffer.concat(buffers.slice(i, i + CHUNK)));
-              // A long synchronous group blocks the event loop; refresh the
-              // heartbeat here so no waiter mistakes this holder for dead.
-              writeHeartbeat();
-            }
-            if (fsync) fsyncSync(fd);
-          } catch (err) {
-            try {
-              closeSync(fd);
-            } catch {
-              // Already closed.
-            }
-            // Nothing is applied in memory; the uncommitted bracket is
-            // severed on reopen/heal. Stop the instance so later writes
-            // cannot glue themselves onto the partial group.
-            broken = true;
-            throw err;
-          }
-          try {
-            closeSync(fd);
-          } catch {
-            // Already closed.
-          }
-          // Same post-write credential check as single publish.
-          reassertLocked();
-
-          // Durable first, state after.
-          for (const part of planned) {
-            if (!part.effective) continue;
-            const { ack, size, key } = part.effective;
-            st.seq = ack.seq;
-            st.bytes += size;
-            st.usageBytes += size;
-            st.published += 1;
-            if (key !== undefined) st.dedup.set(key, { id: ack.id, seq: ack.seq });
-          }
-          absorb(st);
-
-          const acks = planned.map((part) =>
-            part.reuse
-              ? { id: part.reuse.id, seq: part.reuse.seq }
-              : { id: part.effective.ack.id, seq: part.effective.ack.seq },
-          );
           for (const [key, reservation] of reservations) {
             groupPending.delete(key);
-            reservation.resolve(keyAcks.get(key));
+            reservation.resolve(keyFirst.get(key));
           }
           return acks;
-        });
-      }).catch((err) => {
-        // Covers write failure inside the job and rejection before the job
-        // body (closed/broken/fenced bus): release any reservation still
-        // pointing at this failed group.
-        for (const [key, reservation] of reservations) {
-          if (groupPending.get(key) === reservation) groupPending.delete(key);
-          reservation.reject(err);
-        }
-        throw err;
-      });
+        },
+        (err) => {
+          // Covers write failure inside the job and rejection before the
+          // job body (closed/broken/fenced bus): release any reservation
+          // still pointing at this failed group.
+          for (const [key, reservation] of reservations) {
+            if (groupPending.get(key) === reservation) groupPending.delete(key);
+            reservation.reject(err);
+          }
+          throw err;
+        },
+      );
     },
 
     replay(from = 0) {
@@ -1497,23 +2389,30 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
         if (closed || broken) {
           throw new Error('bus is closed');
         }
-        return withOwnership((lease, st0) => {
-          const st = prepareLocked(st0);
+        return withOwnership(() => {
+          // Message payloads are not kept in the write hot-cache, so a read
+          // takes a fresh non-destructive directory scan (the same scan the
+          // baseline paid; the write drain never does).
+          const full = scanDirectory(dir);
+          adoptFullScan(full);
           // replay(from) is inclusive of from; messagesAfter takes an
-          // exclusive lower bound.
-          const out = messagesAfter(st, from - 1);
+          // exclusive lower bound. Replay does not drain staged publish
+          // requests: lock acquisition order is the total order, so a
+          // request still only staged lands after this marker.
+          const out = messagesAfter(view, from - 1);
           const n = out.length;
           if (n > 0) {
+            const line = JSON.stringify({ t: 's', n, g: epoch }) + '\n';
             try {
-              writeEntry({ t: 's', n, g: epoch });
+              appendTo(logPath, Buffer.from(line, 'utf8'), fsync);
             } catch (err) {
               broken = true;
               throw err;
             }
-            st.replayed += n;
-            absorb(st);
-          } else {
-            absorb(st);
+            reassertLocked();
+            view.replayed += n;
+            syncScalars();
+            noteAppended(Buffer.byteLength(line, 'utf8'));
           }
           return out;
         });
@@ -1528,14 +2427,7 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
       // takeover); only registering a brand-new name writes and is fenced.
       let current;
       try {
-        current = withOwnership(
-          (lease, st) => {
-            const value = st.positions.get(name);
-            absorb(st);
-            return value;
-          },
-          { readonly: true },
-        );
+        current = withOwnership(() => view.positions.get(name), { readonly: true });
       } catch (err) {
         if (!fenced && !isLockError(err)) broken = true;
         throw err;
@@ -1548,7 +2440,6 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
         throw new Error('bus write ownership was taken over by another process');
       }
       persistPosition(name, 0);
-      positions.set(name, 0);
       return 0;
     },
 
@@ -1562,14 +2453,7 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
       // advancing the same consumer obey the no-backwards rule together.
       let current;
       try {
-        current = withOwnership(
-          (lease, st) => {
-            const value = st.positions.get(name);
-            absorb(st);
-            return value;
-          },
-          { readonly: true },
-        );
+        current = withOwnership(() => view.positions.get(name), { readonly: true });
       } catch (err) {
         if (!fenced && !isLockError(err)) broken = true;
         throw err;
@@ -1584,7 +2468,6 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
       }
       // An unknown name is auto-registered, same as register() first.
       persistPosition(name, to);
-      positions.set(name, to);
       return to;
     },
 
@@ -1595,16 +2478,15 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
       assertName(name);
       // Read-only: even a fenced instance may read, but an unknown name is
       // auto-registered (a write), which a fenced instance may not do.
-      let st;
+      // Message payloads live on disk, not the write hot-cache, so a read
+      // takes its own non-destructive scan.
       let pos;
+      let readView;
       try {
-        withOwnership(
-          (lease, view) => {
-            st = view;
-            pos = view.positions.get(name);
-          },
-          { readonly: true },
-        );
+        withOwnership(() => {
+          readView = scanDirectory(dir);
+          pos = readView.positions.get(name);
+        }, { readonly: true });
       } catch (err) {
         if (!fenced && !isLockError(err)) broken = true;
         throw err;
@@ -1613,13 +2495,9 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
         // Persists a position line, so it validates the credential.
         persistPosition(name, 0);
         pos = 0;
-        st.positions.set(name, 0);
-        absorb(st);
-      } else {
-        absorb(st);
       }
       // read never moves the position; advance() is how consumption lands.
-      return messagesAfter(st, pos);
+      return messagesAfter(readView, pos);
     },
 
     compact() {
@@ -1630,10 +2508,13 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
         if (closed || broken) {
           throw new Error('bus is closed');
         }
-        withOwnership((lease, st0) => {
-          // Credential validated at the lock door; heal any interrupted
-          // earlier compact/truncate before starting this one.
-          const st = prepareLocked(st0);
+        withOwnership(() => {
+          // Credential validated at the lock door; the catch-up there
+          // healed any interrupted earlier compact/truncate. Folding
+          // needs every surviving payload, so take the fresh full scan
+          // (the write hot-cache deliberately omits message bodies).
+          const st = scanDirectory(dir);
+          adoptFullScan(st);
 
           // Fold every surviving message: snapshot contents plus the live
           // log, skipping anything truncation already discarded.
@@ -1743,9 +2624,9 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
 
           // Refresh the cache from the settled directory and let the scan
           // physically reclaim superseded scoped snapshots it flags.
-          const settled = scanDirectory(dir);
-          healLocked(settled);
-          absorb(scanDirectory(dir));
+          let settled = scanDirectory(dir);
+          if (healLocked(settled)) settled = scanDirectory(dir);
+          adoptFullScan(settled);
         });
       });
     },
@@ -1767,10 +2648,11 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
         if (closed || broken) {
           throw new Error('bus is closed');
         }
-        withOwnership((lease, st0) => {
+        withOwnership(() => {
           // Credential validated before the seal; the whole truncation is
-          // one locked critical section.
-          let st = prepareLocked(st0);
+          // one locked critical section. The catch-up reconciled and
+          // healed everything before this point.
+          let st = view;
 
           // Truncation deals in whole segments only: seal the active
           // segment so its contents become eligible, and roll a fresh one.
@@ -1819,7 +2701,7 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
           // Nothing can go: the roll above (if any) is the only effect.
           // Write no marker; the fresh active log stays empty.
           if (doomed.length === 0) {
-            absorb(scanDirectory(dir));
+            adoptFullScan(scanDirectory(dir));
             return;
           }
 
@@ -1892,7 +2774,7 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
           // covers). The cumulative stats bytes/published stay put by
           // construction — only the marker carries them.
           st = scanDirectory(dir);
-          absorb(st);
+          adoptFullScan(st);
         });
       });
     },
@@ -1931,11 +2813,34 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
       return enqueue(() => {
         // Drop this session from the shared lease and remove its heartbeat
         // file. With no live sessions left remove the lease file so the
-        // next opener starts clean; the epoch high-water file stays, so the
-        // epoch still never repeats.
+        // next opener starts clean; the epoch high-water file stays, so
+        // the epoch still never repeats. Any staging files this session
+        // left behind (only possible if a job was interrupted) are
+        // reclaimed here; a settled token keeps its outcome for exactly
+        // one sweep, an unsettled one is removed wholesale.
         try {
           withLockSync(() => {
             rmSync(heartbeatPath, { force: true });
+            for (const name of (() => {
+              try {
+                return readdirSync(dir);
+              } catch {
+                return [];
+              }
+            })()) {
+              const qm = QUEUE_RE.exec(name);
+              if (qm) {
+                let req = null;
+                try {
+                  req = JSON.parse(readFileSync(path.join(dir, name), 'utf8'));
+                } catch {
+                  req = null;
+                }
+                if (!req || req.s === sessionId) {
+                  rmSync(path.join(dir, name), { force: true });
+                }
+              }
+            }
             const lease = readLeaseLocked();
             if (!lease) return;
             const sessions = lease.sessions.filter((s) => s.id !== sessionId);

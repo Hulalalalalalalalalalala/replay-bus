@@ -49,6 +49,16 @@ The log is a chain of segment files in the bus directory: the active `bus.jsonl`
 
 Multi-writer coordination files in the same directory are `bus.lock` (the mutex), `bus.owner.json` (the lease: epoch and live sessions), `bus.epoch` (the durable epoch high-water mark) and one `bus.hb.<session>` heartbeat per open process. Snapshots taken with multiple writers possible are stored at generation/epoch-scoped names (`bus.snapshot.g<gen>.e<epoch>.json`), with `bus.snapshot.json` kept as a canonical mirror; all are valid snapshot inputs on recovery. None of these coordination files are part of the message log and all are managed automatically.
 
+## Commit pipeline
+
+Appends do not rebuild the bus state from the directory on every write. Each publish/publishBatch is validated and serialized up front, then staged into a lock-free per-request file (`bus.q.<token>.json`, written through a session-scoped tmp and atomically renamed) **without** holding the mutex. When a writer next takes `bus.lock` it *drains* every staged request from every live process as one unit:
+
+- all requests merge into a **single bracketed commit group** — one `{t:'b'}` begin, the merged message lines, one `{t:'bk'}` commit — so one chunked flush covers the whole group;
+- sequence numbers are allocated once for the merged set (continuous, no holes or repeats even across processes), dedup keys resolve once across history and across every request in the group (in-group and cross-process repeats reuse the first acknowledgement and consume no quota), the byte quota is judged per merged item against every writer's occupancy (an item or a whole batch that does not fit is rejected with state untouched), and the four cumulative counters advance once for the group;
+- the complete plan is persisted to a decision file (`bus.c.<gid>.json`) before the group is flushed, and each request's outcome — its acks or its exact rejection — is written to `bus.r.<token>.json` only after the commit is durable, so a request drained by another process, or after a crash mid-flush, is adopted with its original result.
+
+The merged state is kept between drains by an incremental reader of the active log tail (keyed by device/inode and the log's first-line fingerprint), so the write path never does the full directory walk; compaction and truncation (which replace the head) transparently fall back to one full scan. The epoch credential is re-validated at every pipeline boundary (lock entry, decision, each flush chunk, commit, settlement): a holder taken over while queued or mid group fails its whole request, and its group either never commits or is filtered wholesale by the epoch fence — no stale byte mixes into the log. A write or fsync failure rolls the entire group back physically, leaving the bus byte-for-byte as it was. A crash leaves either the complete group or none of it: the uncommitted bracket/torn tail is severed and the decision reconciles the survivors on the next open.
+
 ## Tests
 
     npm test
