@@ -2,6 +2,7 @@ import {
   openSync,
   closeSync,
   writeSync,
+  readSync,
   fsyncSync,
   mkdirSync,
   readFileSync,
@@ -34,8 +35,7 @@ const OWNER_NAME = 'bus.owner.json';
 const EPOCH_NAME = 'bus.epoch';
 // Per-session heartbeat files (bus.hb.<sessionId>) are written WITHOUT the
 // mutex, so a process blocked waiting for the lock still proves it is alive
-// and is never wrongly taken over. A session whose newest heartbeat is older
-// than LEASE_MS is dead and may be replaced.
+// and is never wrongly taken over.
 const HB_PREFIX = 'bus.hb.';
 const HB_TMP_PREFIX = 'bus.hb.tmp.';
 // Every temp file a write uses is session-scoped under one of these
@@ -167,6 +167,124 @@ const segmentMaxSeq = (filePath) => {
   return max;
 };
 
+// Epoch helpers shared by the full scanner and the incremental applier. A
+// line is stale only when it carries an explicit epoch stamp below the
+// fence watermark; unstamped legacy lines always count.
+const epochOfEntry = (entry) =>
+  entry !== null && typeof entry.g === 'number' ? entry.g : 0;
+const isStaleEntry = (entry, watermark) =>
+  entry !== null && typeof entry.g === 'number' && entry.g < watermark;
+
+/**
+ * Apply one committed log entry to a scan-shaped state. Exactly the same
+ * filtering/accounting rules scanDirectory uses for a full replay, factored
+ * out so an incremental delta can reuse them:
+ *  - stale-epoch bytes (a preempted holder writing after the fence) never
+ *    enter counters, positions, dedup, occupancy or the visible log;
+ *  - messages at/below the truncation horizon stay discarded (only the
+ *    marker carries their cumulative counters);
+ *  - retained occupancy grows by the entry's business bytes.
+ */
+function applyCommittedEntry(st, entry, watermark) {
+  if (isStaleEntry(entry, watermark)) return;
+  if (entry.t === 'm') {
+    if (entry.seq <= st.horizon) return;
+    st.seq = entry.seq;
+    st.bytes += entry.bytes;
+    st.usageBytes += entry.bytes;
+    st.published += 1;
+    if (typeof entry.d === 'string') {
+      st.dedup.set(entry.d, { id: entry.id, seq: entry.seq });
+    }
+    st.live.push({ seq: entry.seq, id: entry.id, record: entry.record });
+  } else if (entry.t === 's') {
+    st.replayed += entry.n;
+  } else if (entry.t === 'p') {
+    st.positions.set(entry.name, entry.pos);
+  }
+}
+
+// A truncate marker is an absolute checkpoint: counters, positions and the
+// dedup table it carries replace whatever earlier history established.
+function applyMarkerEntry(st, entry) {
+  st.seq = entry.seq;
+  st.bytes = entry.bytes;
+  st.published = entry.published;
+  st.replayed = entry.replayed;
+  st.horizon = entry.horizon;
+  st.positions.clear();
+  for (const [name, pos] of Object.entries(entry.positions)) st.positions.set(name, pos);
+  st.dedup.clear();
+  for (const [key, value] of entry.dedup) st.dedup.set(key, value);
+}
+
+/**
+ * Apply a buffer of NEWLY visible log bytes on top of an existing scanned
+ * state, using exactly the committed-bracket / fence recovery rules a full
+ * replay uses. Only appended bytes are ever passed in (the structural
+ * fingerprint guarantees the files' older prefixes are unchanged), so this
+ * is the piece that replaces the per-write full directory rescan: the
+ * common publish path reads just the bytes the previous commit added.
+ *
+ * Returns how many of the new bytes were processed, the watermark at the
+ * end, and `tornLength` — the physical file length the active log must be
+ * cut back to when the suffix held an uncommitted bracket or a torn line.
+ * Uncommitted entries are collected but never applied.
+ */
+function applyLogDelta(st, buf, baseOffset, startWatermark) {
+  let watermark = startWatermark;
+  let lineStart = 0;
+  let processedEnd = 0;
+  let group = null;
+  let tornLength = null;
+
+  for (let i = 0; i < buf.length; i++) {
+    if (buf[i] !== 0x0a) continue;
+    const entry = i > lineStart ? JSON.parse(buf.toString('utf8', lineStart, i)) : null;
+    const completeEnd = i + 1;
+    if (entry && entry.t === 'f') {
+      if (epochOfEntry(entry) > watermark) watermark = epochOfEntry(entry);
+      st.fenceEpoch = Math.max(st.fenceEpoch, watermark);
+      // The fence aborts any batch a preempted holder left open.
+      group = null;
+    } else if (group !== null) {
+      if (isStaleEntry(entry, watermark)) {
+        // Preempted holder's bytes (even a matching-looking commit) never
+        // close or apply the current group.
+      } else if (entry && entry.t === 'bk' && entry.id === group.id) {
+        for (const e of group.entries) applyCommittedEntry(st, e, watermark);
+        group = null;
+      } else if (entry && entry.t === 'b') {
+        // The previous group never committed; track the new one instead.
+        group = { id: entry.id, entries: [], beginOffset: lineStart };
+      } else if (entry) {
+        group.entries.push(entry);
+      }
+    } else if (entry && entry.t === 'b') {
+      if (isStaleEntry(entry, watermark)) {
+        // A stale uncommitted group: ignore it but keep its bytes.
+      } else {
+        group = { id: entry.id, entries: [], beginOffset: lineStart };
+      }
+    } else if (entry) {
+      if (entry.t === 't') applyMarkerEntry(st, entry);
+      else applyCommittedEntry(st, entry, watermark);
+    }
+    processedEnd = completeEnd;
+    lineStart = completeEnd;
+  }
+
+  if (group !== null) {
+    // An open bracket at EOF: crash/seizure mid-group. Its physical prefix
+    // ends before the begin line; none of its entries were applied.
+    tornLength = baseOffset + group.beginOffset;
+  } else if (lineStart < buf.length) {
+    // A torn trailing line with no terminating newline.
+    tornLength = baseOffset + lineStart;
+  }
+  return { consumed: processedEnd, watermark, tornLength };
+}
+
 /**
  * Non-destructive view of the whole directory. Applies exactly the same
  * recovery rules the single-process opener used (snapshot anchor, truncate
@@ -199,31 +317,16 @@ function scanDirectory(dir) {
   // Every accepted log-side message (same filtering as recovery), used to
   // recompute retained occupancy without re-parsing files.
   const accepted = [];
-  // Highest epoch fenced off in this directory: complete log bytes carrying
-  // a smaller epoch that physically follow a fence line are bytes a
-  // preempted holder wrote after losing ownership — never mixed into state.
+  // Highest epoch fenced off in this directory.
   let fenceEpoch = 0;
   let nextSegmentIndex = 1;
 
-  // Snapshot candidates are resolved AFTER the ordered log and its fence
-  // watermark are known (see below): an anchor-less snapshot from a holder a
-  // higher fence displaced must never become a reset basis.
-
-  // A line is stale only when it carries an explicit epoch stamp below the
-  // fence watermark. Lines written before multi-writer support have no
-  // stamp and were committed by a legitimate holder, so they always count.
-  const epochOf = (entry) => (entry !== null && typeof entry.g === 'number' ? entry.g : 0);
-  const isStale = (entry, watermark) =>
-    entry !== null && typeof entry.g === 'number' && entry.g < watermark;
+  const epochOf = (entry) => epochOfEntry(entry);
+  const isStale = (entry, watermark) => isStaleEntry(entry, watermark);
 
   const applyEntry = (entry, watermark) => {
-    // A line stamped with an epoch below the current fence watermark was
-    // written by a holder that had already lost ownership: it never mixes
-    // into counters, positions, dedup or the visible log.
     if (isStale(entry, watermark)) return;
     if (entry.t === 'm') {
-      // At/below the horizon the message was discarded by truncation; only
-      // its cumulative counters (carried by the marker) survive.
       if (entry.seq <= state.horizon) return;
       state.seq = entry.seq;
       state.bytes += entry.bytes;
@@ -241,40 +344,13 @@ function scanDirectory(dir) {
     }
   };
 
-  // A truncate marker is an absolute checkpoint: the cumulative counters,
-  // positions and dedup table it carries replace whatever earlier segments
-  // established, so recovery can start from the newest marker and ignore
-  // everything before it.
-  const applyMarker = (entry) => {
-    state.seq = entry.seq;
-    state.bytes = entry.bytes;
-    state.published = entry.published;
-    state.replayed = entry.replayed;
-    state.horizon = entry.horizon;
-    state.positions.clear();
-    for (const [name, pos] of Object.entries(entry.positions)) state.positions.set(name, pos);
-    state.dedup.clear();
-    for (const [key, value] of entry.dedup) state.dedup.set(key, value);
-  };
+  const applyMarker = (entry) => applyMarkerEntry(state, entry);
 
   const markerLine = (gen) => JSON.stringify({ t: 'c', gen }) + '\n';
 
   // Replay complete log lines and apply only the committed, non-fenced
-  // prefix. A batch is bracketed by {t:'b',id} .. entries .. {t:'bk',id}: a
-  // begin without its matching commit (crash mid-write, overtaken by a newer
-  // begin, or a fence line) is severed wholesale and none of its entries
-  // take effect. A {t:'f',e} fence raises the epoch watermark: every later
-  // line stamped with a smaller epoch is a preempted holder's byte and is
-  // ignored even when physically complete. The watermark lives in
-  // `fenceState` so it carries across files in segment order. Returns the
-  // byte offset just past the last retainable line, so torn tails and
-  // current-epoch uncommitted tails can be truncated while fenced leftovers
-  // stay put (logically invisible) rather than reshaping the file.
-  // `startWatermark` is the fence watermark established by every earlier
-  // file in segment order. It is positional, not global: history committed
-  // before the fence line (even by the same older epoch) is legitimate and
-  // must be retained; only bytes physically after a fence with a smaller
-  // stamp are discarded.
+  // prefix. Batch brackets, fences and torn tails follow the same rules
+  // applyLogDelta() implements incrementally; see there for the rationale.
   const recoverLog = (raw, startWatermark) => {
     let watermark = startWatermark;
     let lineStart = 0;
@@ -287,20 +363,16 @@ function scanDirectory(dir) {
       if (entry && entry.t === 'f') {
         if (epochOf(entry) > watermark) watermark = epochOf(entry);
         fenceEpoch = Math.max(fenceEpoch, watermark);
-        // The fence aborts any batch a preempted holder left open.
         group = null;
         retainableEnd = completeEnd;
       } else if (group !== null) {
         if (isStale(entry, watermark)) {
-          // Preempted holder's bytes (even a matching-looking commit) never
-          // close or apply the current group.
           retainableEnd = completeEnd;
         } else if (entry && entry.t === 'bk' && entry.id === group.id) {
           for (const e of group.entries) applyEntry(e, watermark);
           group = null;
           retainableEnd = completeEnd;
         } else if (entry && entry.t === 'b') {
-          // The previous group never committed; start tracking the new one.
           group = { id: entry.id, entries: [], beginOffset: lineStart };
           retainableEnd = completeEnd;
         } else if (entry) {
@@ -308,7 +380,6 @@ function scanDirectory(dir) {
         }
       } else if (entry && entry.t === 'b') {
         if (isStale(entry, watermark)) {
-          // A stale uncommitted group: ignore it but keep its bytes.
           retainableEnd = completeEnd;
         } else {
           group = { id: entry.id, entries: [], beginOffset: lineStart };
@@ -322,9 +393,6 @@ function scanDirectory(dir) {
       }
       lineStart = completeEnd;
     }
-    // A current-epoch group still open at EOF is a crash/seizure mid-batch:
-    // its bytes must be severed, so the retainable prefix ends before the
-    // begin line (anything stale past a fence was already ignored above).
     if (group !== null) {
       return Math.min(retainableEnd, group.beginOffset);
     }
@@ -335,8 +403,6 @@ function scanDirectory(dir) {
   for (const seg of segments) {
     if (seg.index >= nextSegmentIndex) nextSegmentIndex = seg.index + 1;
   }
-  // The ordered log is every finalized segment (oldest first) followed by
-  // the active log file.
   const ordered = segments.map((seg) => seg.path);
   if (existsSync(logPath)) ordered.push(logPath);
 
@@ -348,8 +414,7 @@ function scanDirectory(dir) {
 
   // Fences raise the epoch watermark in log order. Walk every file first so
   // each file is scanned with the watermark as of its own position and the
-  // global maximum is known before choosing a snapshot: a fence in an
-  // earlier segment governs later files, never earlier ones.
+  // global maximum is known before choosing a snapshot.
   const watermarkAtStart = [];
   let globalFence = 0;
   {
@@ -366,8 +431,7 @@ function scanDirectory(dir) {
 
   // Choose the newest snapshot among the canonical file and the
   // gen/epoch-scoped files. Generation is primary; within one generation a
-  // higher epoch wins, so a preempted holder finishing a stale compaction
-  // after a takeover can never eclipse the current owner's snapshot.
+  // higher epoch wins.
   const snapshotCandidates = [];
   if (existsSync(snapshotPath)) snapshotCandidates.push({ file: snapshotPath, gen: -1, epoch: 0 });
   for (const name of readdirSync(dir)) {
@@ -404,11 +468,8 @@ function scanDirectory(dir) {
   // Resolve the usable snapshot newest-first. A candidate is usable when its
   // compaction completed (an anchor marker for its generation exists in the
   // log) or, when anchor-less, its writer's epoch is at least the current
-  // fence watermark — i.e. the snapshot landed in its own legitimate
-  // crash window rather than being finished by a holder a later takeover
-  // displaced. Anchor-less candidates below the watermark are orphans: they
-  // are removed and resolution falls back to the next-newest snapshot (whose
-  // anchored history is still intact).
+  // fence watermark. Anchor-less candidates below the watermark are orphans
+  // and resolution falls back to the next-newest snapshot.
   let chosenSnapshot = null;
   let chosenHasAnchor = false;
   for (let k = snapshotCandidates.length - 1; k >= 0; k--) {
@@ -428,12 +489,8 @@ function scanDirectory(dir) {
       loadSnapshot(cand);
       break;
     }
-    // Displaced holder's orphaned snapshot: remove it physically.
     removable.push(cand.file);
   }
-  // Scoped snapshots from older generations are superseded: their contents
-  // live in the chosen snapshot and the anchored log, so reclaim them
-  // rather than letting every compaction pile files up forever.
   if (chosenSnapshot) {
     for (const cand of snapshotCandidates) {
       if (cand === chosenSnapshot) continue;
@@ -443,8 +500,6 @@ function scanDirectory(dir) {
   }
   fenceEpoch = Math.max(fenceEpoch, globalFence);
 
-  // The anchor position for the chosen snapshot generation. A generation-0
-  // truncate marker anchors even when no snapshot file exists.
   let startAt = -1;
   for (let i = 0; i < ordered.length; i++) {
     const first = firstEntry(ordered[i]);
@@ -454,26 +509,14 @@ function scanDirectory(dir) {
   }
 
   if (chosenSnapshot && !chosenHasAnchor) {
-    // Snapshot rename landed but the log reset did not: every byte still on
-    // disk is already folded into the snapshot. Recovery deletes the
-    // segments and resets to a marker-led log. The orphan rule above
-    // prevents a displaced holder's late snapshot from triggering this.
     reset = true;
     for (const seg of segments) removable.push(seg.path);
   } else {
-    // Replay the live suffix starting at THIS file's positional watermark
-    // (a fence in a later file must not retroactively invalidate history
-    // committed before it). Torn tails / uncommitted batch tails are
-    // remembered for physical severing rather than truncated during read.
     for (let i = Math.max(startAt, 0); i < ordered.length; i++) {
       const raw = readFileSync(ordered[i]);
       const committedEnd = recoverLog(raw, watermarkAtStart[i]);
       if (committedEnd < raw.length) tails.push({ path: ordered[i], length: committedEnd });
     }
-    // Segments before the anchor whose content is folded into the snapshot
-    // or at/below the truncation horizon can go. Segments a consumer still
-    // needs (above the horizon) stay untouched and stay readable; their
-    // messages still pass the fence filter as of that segment's position.
     for (let i = 0; i < startAt; i++) {
       const max = segmentMaxSeq(ordered[i]);
       if (max === null || max <= foldedSeq || max <= state.horizon) {
@@ -498,9 +541,6 @@ function scanDirectory(dir) {
   }
   live.sort((a, b) => a.seq - b.seq);
 
-  // Retained occupancy is exactly the retained messages: snapshot survivors
-  // above the horizon plus the accepted log-side messages collected above.
-  // Torn tails, uncommitted batches and fenced stale bytes never count.
   let usageBytes = 0;
   for (const m of baseMessages) {
     if (m.seq > state.horizon) usageBytes += Buffer.byteLength(JSON.stringify(m.record), 'utf8');
@@ -574,8 +614,6 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
   try {
     mkdirSync(dir, { recursive: true });
   } catch (err) {
-    // Directory deleted out from under us, or insufficient permissions:
-    // opening throws Error synchronously.
     throw new Error(`createBus: cannot open bus directory: ${err.message}`);
   }
 
@@ -656,9 +694,7 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
   };
 
   // The heartbeat carries no state that is ever read: liveness is judged
-  // solely from the file's mtime. Write it with a cheap truncating
-  // open/write/close (no fsync, no atomic rename) so the periodic timer stays
-  // light even on slow filesystems and never contends on directory entries.
+  // solely from the file's mtime.
   const writeHeartbeat = () => {
     let fd;
     try {
@@ -694,9 +730,7 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
   // Apply repairs a scan found (torn tails, leftovers of an interrupted
   // compact/truncate, snapshot-landed-but-log-not reset). Unlinks are
   // unconditional; directory syncs are best-effort and never block or fail
-  // the repair. Safe to run during acquisition: it only needs the scan.
-  // Returns true when it physically changed something, so the caller knows
-  // it must rescan instead of reusing the pre-repair view.
+  // the repair.
   const healLocked = (st) => {
     let changed = false;
     for (const tail of st.tails) {
@@ -704,8 +738,7 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
         truncateSync(tail.path, tail.length);
         changed = true;
       } catch {
-        // Another path may have healed it concurrently under the same lock;
-        // a remaining tail is reconciled again next time / on reopen.
+        // Another path may have healed it concurrently under the same lock.
       }
     }
     for (const segPath of st.removable) {
@@ -734,24 +767,15 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
     return changed;
   };
 
-  // Settle a mutation critical section from an already-scanned view: heal
-  // whatever it found, then rescan only when healing actually moved bytes.
-  // This keeps the common case (a healthy directory) to the single scan
-  // withOwnership already performed.
-  const prepareLocked = (st) => (healLocked(st) ? scanDirectory(dir) : st);
-
-  // Take the cross-process mutex once, synchronously, for acquisition: the
-  // lease decision must itself be serialized against other openers. A lock
-  // is broken only when BOTH its directory mtime and the holder's heartbeat
-  // are stale, so a live process in the middle of a long write is never
-  // preempted.
+  // Take the cross-process mutex once, synchronously. A lock is broken only
+  // when BOTH its directory mtime and the holder's heartbeat are stale, so a
+  // live process in the middle of a long write is never preempted.
   const withLockSync = (fn, waitMs = LOCK_WAIT_MS) => {
     const started = Date.now();
     let lastBeat = Date.now();
     for (;;) {
       try {
         mkdirSync(lockPath);
-        // Payload lets a waiter identify THIS holder's heartbeat file.
         try {
           writeFileSync(path.join(lockPath, 'holder'), sessionId);
         } catch {
@@ -763,8 +787,7 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
           throw new Error(`bus lock unavailable: ${err.message}`);
         }
         // While blocked in this synchronous spin the event loop (and the
-        // heartbeat timer) is frozen; refresh the heartbeat inline so a long
-        // wait for a contended lock never makes THIS process look dead.
+        // heartbeat timer) is frozen; refresh the heartbeat inline.
         if (Date.now() - lastBeat > RENEW_MS) {
           writeHeartbeat();
           lastBeat = Date.now();
@@ -776,14 +799,11 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
           // The holder may already be removing it; retry immediately.
         }
         if (lockAge !== null && lockAge > LOCK_STALE_MS) {
-          // Find the holder's heartbeat via the lock payload written on
-          // acquire; break only if that session is also stale.
           let holderId = null;
           try {
             holderId = readFileSync(path.join(lockPath, 'holder'), 'utf8').trim() || null;
           } catch {
-            // No payload (a crash before it was written): fall back to the
-            // lease sessions, and break only if none of them are alive.
+            // No payload: fall back to the lease sessions.
           }
           let trulyDead = false;
           if (holderId) {
@@ -834,10 +854,6 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
       let lease;
       let tookOver = false;
       if (current && anySessionAlive(current) && current.epoch >= high) {
-        // A live holder (possibly this same process opening a second bus):
-        // join its epoch, so concurrent live writers interleave under one
-        // still-valid credential. Drop sessions whose heartbeat already
-        // expired (a crashed peer sharing the lease) and their leftovers.
         epoch = current.epoch;
         const live = current.sessions.filter((s) => {
           if (heartbeatAlive(s.id)) return true;
@@ -846,13 +862,9 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
         });
         lease = { epoch, sessions: live.concat([me]) };
       } else {
-        // No fresh lease — first open, clean close, or a crashed/stale
-        // holder: take over. The epoch credential increments and the old
-        // holder is fenced on its very next write.
         epoch = Math.max(current ? current.epoch : 0, high) + 1;
         lease = { epoch, sessions: [me] };
         tookOver = current !== null;
-        // Heartbeat files of dead sessions are pure leftovers; drop them.
         if (current) {
           for (const s of current.sessions) {
             if (!heartbeatAlive(s.id)) {
@@ -865,16 +877,8 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
       writeEpochHighWaterLocked(epoch);
 
       // Opening performs the same physical recovery the single-process bus
-      // did synchronously: discard half snapshot/log tmp files, sever torn
-      // tails and uncommitted batches, reconcile an interrupted
-      // compact/truncate, and reset when the snapshot landed but the log did
-      // not. One opener healing here means no later writer has to guess.
-      //
-      // Sweep every stale temp file (fixed legacy names plus session-scoped
-      // leftovers from crashed holders). A fresh, actively-written tmp from a
-      // concurrent holder cannot exist here: this opener holds the mutex and
-      // only removes tmp files older than the lease window, and a live
-      // holder's tmp lives for milliseconds inside its own lock.
+      // did synchronously: discard stale tmp files, sever torn tails and
+      // uncommitted batches, reconcile an interrupted compact/truncate.
       {
         const now = Date.now();
         let names = [];
@@ -894,19 +898,13 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
             }
           }
         }
-        // Fixed legacy temp names are always safe to drop (they can only be
-        // half-written crash leftovers; current code never writes them).
         rmSync(snapshotTmpPath, { force: true });
         rmSync(logTmpPath, { force: true });
       }
       healLocked(scanDirectory(dir));
 
       if (tookOver) {
-        // A previous lease was displaced: stamp the epoch barrier into the
-        // log. Anything a preempted holder still manages to append after
-        // this line (it was frozen mid-write, or racing the takeover) is
-        // stamped with a smaller epoch and ignored by every reader, so old
-        // bytes can never mix into the log. Always fsynced: the barrier
+        // Stamp the epoch barrier into the log. Always fsynced: the barrier
         // must be at least as durable as the stale writes it invalidates.
         const fenceFd = openSync(logPath, 'a');
         try {
@@ -916,7 +914,6 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
           closeSync(fenceFd);
         }
       }
-      // The opener is fully live: make the heartbeat fresh post-recovery.
       writeHeartbeat();
       return lease;
     });
@@ -926,7 +923,7 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
   void initialLease;
 
   // Cached merged view, refreshed under the lock by every job and used as
-  // the after-close / lock-busy fallback. Starts from the lease-time view.
+  // the after-close / lock-busy fallback.
   let seq = 0;
   let bytes = 0;
   let published = 0;
@@ -934,11 +931,10 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
   let usageBytes = 0;
   const dedup = new Map();
   const positions = new Map();
-  // dedupKey -> { promise, resolve, reject } for first publish in flight
+  // dedupKey -> reservation for the first in-flight single / batch carrying
+  // that key; concurrent resends share the reservation's promise just like
+  // the committed table shares one first acknowledgement.
   const pending = new Map();
-  // dedupKey -> { promise, resolve, reject } reserved by the first
-  // in-flight batch carrying that key; lets later singles/batches share
-  // the batch's first acknowledgement just like `pending` does for singles
   const groupPending = new Map();
 
   const absorb = (st) => {
@@ -953,41 +949,291 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
     for (const [name, pos] of st.positions) positions.set(name, pos);
   };
 
-  // Prime the cache from the shared directory before createBus returns, so
-  // stats() is correct immediately (single-process behaviour).
-  try {
-    withLockSync(() => absorb(scanDirectory(dir)), VIEW_WAIT_MS * 10);
-  } catch {
-    // Another writer holds the lock for long: cache stays zero and the
-    // first operation rescans under the lock.
-  }
+  // ---------------------------------------------------------------------
+  // Incremental directory view.
+  //
+  // Every mutation used to rebuild its input by scanning the whole
+  // directory: readdir plus a full read/parse of every finalized segment,
+  // the active log and the chosen snapshot. The commit pipeline instead
+  // keeps one long-lived view and reconciles it under the lock:
+  //
+  //   - fingerprint: readdir + stat of the state-bearing entries (metadata
+  //     only, no file contents). A plain append to bus.jsonl changes only
+  //     the active size — by far the common case under load.
+  //   - delta: for a pure append, positional-read just the newly visible
+  //     bytes (fd read at the saved offset) and apply them through the same
+  //     committed-bracket/fence rules recovery uses.
+  //   - full scan: only when the structure actually changed — segment
+  //     seal/delete (truncate), log replacement (compact), snapshot
+  //     churn, epoch movement, or a shrunk/replaced active log — i.e. the
+  //     rare operations, not every publish.
+  //
+  // `active` remembers how many active-log bytes were already consumed and
+  // the fence watermark as of that prefix. The active file is always last in
+  // segment order, so its starting watermark is the directory's fence
+  // high-water mark.
+  const view = {
+    ready: false,
+    st: null,
+    fp: null,
+    activeConsumed: 0,
+    activeIno: '',
+    activeWatermark: 0,
+    activeMissing: true,
+    // Physical length to cut the active log back to when its unread suffix
+    // held a torn line / uncommitted bracket (null when healthy).
+    tornLength: null,
+  };
 
-  let chain = Promise.resolve();
+  // Metadata fingerprint. `value` covers every state-bearing entry except
+  // the active log's content; the active log is identified by its inode
+  // (dev+ino) plus size, because truncate can replace bus.jsonl with a
+  // brand-new file of the SAME byte size while sealing+deleting nets out the
+  // segment set — size alone cannot prove the cached prefix still lines up.
+  const fingerprintLocked = () => {
+    let names;
+    try {
+      names = readdirSync(dir);
+    } catch {
+      return { value: '__unreadable__', activeSize: -2, activeIno: '' };
+    }
+    const parts = [];
+    let activeSize = -1;
+    let activeIno = '';
+    for (const name of names) {
+      if (name === LOG_NAME) {
+        try {
+          const s = statSync(logPath);
+          activeSize = s.size;
+          activeIno = `${s.dev}:${s.ino}`;
+        } catch {
+          activeSize = -1;
+          activeIno = '';
+        }
+        continue;
+      }
+      if (
+        SEGMENT_RE.test(name) ||
+        name === SNAPSHOT_NAME ||
+        SNAPSHOT_SCOPED_RE.test(name) ||
+        name === EPOCH_NAME
+      ) {
+        let size = -1;
+        let mtime = 0;
+        let ino = '';
+        try {
+          const s = statSync(path.join(dir, name));
+          size = s.size;
+          mtime = Math.round(s.mtimeMs);
+          ino = `${s.dev}:${s.ino}`;
+        } catch {
+          // Vanished between readdir and stat: encode as missing.
+        }
+        parts.push(`${name}:${ino}:${size}:${mtime}`);
+      }
+    }
+    parts.sort();
+    return { value: parts.join('|'), activeSize, activeIno };
+  };
+
+  const seedFromScanLocked = (fp) => {
+    const st = scanDirectory(dir);
+    view.st = st;
+    view.fp = fp;
+    view.tornLength = null;
+    let activeConsumed = 0;
+    let activeMissing = true;
+    try {
+      activeConsumed = statSync(logPath).size;
+      activeMissing = false;
+    } catch {
+      activeConsumed = 0;
+      activeMissing = true;
+    }
+    view.activeConsumed = activeConsumed;
+    view.activeIno = activeMissing ? '' : fp.activeIno;
+    // The active file is last in order; fences only ever rise, so the
+    // watermark anywhere in its committed prefix is the directory high
+    // water mark.
+    view.activeWatermark = st.fenceEpoch;
+    view.activeMissing = activeMissing;
+    // The full scan already classified physical repairs non-destructively.
+    const activeTail = st.tails.find((tail) => tail.path === logPath);
+    if (activeTail) view.tornLength = activeTail.length;
+    view.ready = true;
+    return st;
+  };
+
+  // Positional read of [start, end) of the active log.
+  const readActiveRangeLocked = (start, end) => {
+    const buf = Buffer.allocUnsafe(Math.max(0, end - start));
+    const fd = openSync(logPath, 'r');
+    try {
+      let off = 0;
+      while (off < buf.length) {
+        const n = readSync(fd, buf, off, buf.length - off, start + off);
+        if (!n) break;
+        off += n;
+      }
+      return buf.subarray(0, off);
+    } finally {
+      closeSync(fd);
+    }
+  };
+
+  // Bring `view` up to date with the shared directory while the cross
+  // process lock is held. Never mutates disk. Returns the merged state.
+  const reconcileLocked = () => {
+    const fp = fingerprintLocked();
+
+    if (!view.ready) {
+      return seedFromScanLocked(fp);
+    }
+
+    // This view already classified the active log as carrying an
+    // uncommitted/torn suffix that only a mutating job can remove. Another
+    // holder may have truncated it away (and appended past the old size) in
+    // one critical section under the same mutex, so an offset/identity
+    // comparison alone cannot prove the cached prefix still lines up:
+    // rebuild fully until the directory reports a healthy tail. This is a
+    // crash-path cost only — a healthy active log never sets it.
+    if (view.tornLength !== null) {
+      return seedFromScanLocked(fp);
+    }
+
+    const structural = fp.value !== view.fp.value;
+    const activeShrank = !view.activeMissing && fp.activeSize < view.activeConsumed;
+    const activeAppeared = view.activeMissing && fp.activeSize >= 0;
+    // The active log was replaced (truncate seal/roll, compaction reset)
+    // even though its new size/segment set may coincidentally match: the
+    // cached offset points into a different inode, so rebuild.
+    const activeReplaced =
+      !view.activeMissing && fp.activeIno !== '' && fp.activeIno !== view.activeIno;
+
+    if (structural || activeShrank || activeReplaced) {
+      // Segments/snapshots/epoch changed, the active log shrank (a heal) or
+      // it was replaced in place by truncate/compaction: rebuild the view.
+      return seedFromScanLocked(fp);
+    }
+
+    view.fp = fp;
+    view.activeIno = fp.activeIno;
+
+    const activeGrew = fp.activeSize > view.activeConsumed;
+    if (!activeGrew) {
+      // Same bytes: the cached state is current.
+      return view.st;
+    }
+
+    if (activeAppeared) {
+      // The active log was created since the last view; start it at zero.
+      view.activeMissing = false;
+      view.activeConsumed = 0;
+      view.activeIno = fp.activeIno;
+      view.activeWatermark = view.st.fenceEpoch;
+    }
+
+    let chunk;
+    try {
+      chunk = readActiveRangeLocked(view.activeConsumed, fp.activeSize);
+    } catch {
+      // The log vanished/changed between stat and read: rebuild fully.
+      return seedFromScanLocked(fingerprintLocked());
+    }
+    if (chunk.length < fp.activeSize - view.activeConsumed) {
+      // The file shrank while we read: rebuild fully.
+      return seedFromScanLocked(fingerprintLocked());
+    }
+
+    const result = applyLogDelta(
+      view.st,
+      chunk,
+      view.activeConsumed,
+      view.activeWatermark,
+    );
+    view.activeConsumed += result.consumed;
+    view.activeWatermark = result.watermark;
+    if (result.tornLength !== null) view.tornLength = result.tornLength;
+    return view.st;
+  };
+
+  // Mutating entry point. withOwnership already reconciled the view under
+  // the lock; this only physically heals crash debris the reconciler
+  // classified (torn tails, interrupted compact/truncate leftovers) and
+  // rebuilds once if healing moved bytes. The common healthy append costs a
+  // single fingerprint per commit and no content reads.
+  const prepareMutationLocked = () => {
+    let st = view.st;
+    const needsHeal =
+      view.tornLength !== null || st.tails.length > 0 || st.removable.length > 0 || st.reset;
+    if (needsHeal) {
+      if (view.tornLength !== null) {
+        st.tails.push({ path: logPath, length: view.tornLength });
+      }
+      healLocked(st);
+      st = seedFromScanLocked(fingerprintLocked());
+      // A tail that survives the heal is re-reported by the fresh scan; a
+      // later mutating job retries. Nothing is appended onto it here.
+    }
+    return st;
+  };
+
+  // Force a full rebuild on the next reconcile after a structural operation
+  // this instance performed itself (compact/truncate rebuild the log).
+  const invalidateViewLocked = () => {
+    view.ready = false;
+    return reconcileLocked();
+  };
+
+  // Fold bytes THIS holder just durably appended and confirmed into the
+  // cached view WITHOUT re-reading/re-parsing them: the entries are exactly
+  // the ones this commit planned, stamped with the current (non-stale)
+  // epoch, and the active file's committed prefix grew by exactly
+  // `byteLength` bytes. This is what keeps a commit to one metadata
+  // fingerprint plus its own write — no trailing positional read.
+  const noteOwnAppendLocked = (entries, byteLength) => {
+    for (const entry of entries) {
+      applyCommittedEntry(view.st, entry, view.activeWatermark);
+    }
+    if (view.activeMissing) {
+      view.activeMissing = false;
+      view.activeConsumed = 0;
+    }
+    view.activeConsumed += byteLength;
+    // Keep the cached active identity/size consistent for the next
+    // fingerprint check; content identity is structural.
+    try {
+      const s = statSync(logPath);
+      view.fp.activeSize = s.size;
+      view.fp.activeIno = `${s.dev}:${s.ino}`;
+      view.activeIno = view.fp.activeIno;
+    } catch {
+      // The next reconcile rebuilds if the file is unexpectedly gone.
+    }
+    return view.st;
+  };
+
   let closed = false;
   // A failed append may leave a torn line; stop appending so later writes
   // cannot glue themselves onto it. The torn tail is healed on the next
   // locked operation (and on reopen).
   let broken = false;
 
-  // All disk mutation by publish/replay/compact/truncate happens inside this
-  // per-process serial chain; each job additionally takes the cross-process
-  // lock, so the on-disk order is a total order across every writer.
-  const enqueue = (job) => {
-    const run = chain.then(job);
-    // A failed job must not stall every later operation.
-    chain = run.then(
-      () => {},
-      () => {},
-    );
-    return run;
-  };
+  // All disk mutation serializes through ONE in-process commit pipeline in
+  // addition to the cross-process lock. Consecutive publish/publishBatch
+  // requests already queued when the pump runs are merged into a single
+  // commit group: seq allocation, dedup registration, the per-entry quota
+  // judgement and the four cumulative counters are settled once for the
+  // merged group, and one bracketed, chunked, fsynced write covers it.
+  // Replay/truncate/compact/close are barriers: writers queued before them
+  // flush first; writers queued after wait behind them — invocation order is
+  // the total order.
+  const queue = [];
+  let pumping = false;
+
+  const isWriterRequest = (item) => item.kind === 'single' || item.kind === 'batch';
 
   // Verify the epoch credential against the shared lease inside the lock.
-  // A raised epoch means ownership was taken over; a missing session means
-  // the credential was revoked. Either way this instance is permanently
-  // fenced: it must never mix another byte into the log. Liveness is proven
-  // separately by the per-session heartbeat file, which the background
-  // timer refreshes even while this call waits for the lock.
   const assertOwnershipLocked = (lease) => {
     if (closed || broken) {
       throw new Error('bus is closed');
@@ -1004,8 +1250,6 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
       throw new Error('bus write ownership was taken over by another process');
     }
     if (lease.epoch < epoch) {
-      // The lease file cannot legitimately move backwards; treat it as
-      // tampering and fence rather than write under uncertainty.
       fenced = true;
       throw new Error('bus write ownership has been invalidated');
     }
@@ -1015,11 +1259,9 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
     }
   };
 
-  // Run `fn(lease, scanView)` under the cross-process lock with a valid
-  // credential. The scan passed in is the current merged directory state.
-  // Read-only callers (an existing position lookup) never assert the
-  // credential, so a fenced instance can still read the shared files; they
-  // must not mutate anything themselves.
+  // Run `fn(lease)` under the cross-process lock with a valid credential,
+  // reconciling the shared view first. Read-only callers never assert the
+  // credential, so a fenced instance can still read the shared files.
   const withOwnership = (fn, { waitMs = LOCK_WAIT_MS, readonly = false } = {}) =>
     withLockSync(() => {
       if (closed || broken) {
@@ -1029,17 +1271,17 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
       if (!readonly) {
         assertOwnershipLocked(lease);
         // Entering the critical section counts as a fresh liveness signal
-        // for the whole (synchronous, timer-frozen) job; the long phases
-        // refresh again between fsyncs.
+        // for the whole (synchronous, timer-frozen) job.
         writeHeartbeat();
       }
-      return fn(lease, scanDirectory(dir));
+      reconcileLocked();
+      return fn(lease, view.st);
     }, waitMs);
 
-  // Re-verify ownership at a multi-phase boundary while still holding the
-  // lock. A holder keeps its heartbeat fresh even inside long synchronous
-  // writes (writeHeartbeat between chunks), so a positive result here is
-  // sound: the lock cannot have been stolen out from under a live job.
+  // Re-verify ownership at a pipeline phase boundary while still holding
+  // the lock. A raised epoch (a takeover that landed between stages) fences
+  // this instance and invalidates the whole group: none of the bytes the
+  // group planned may reach the committed log.
   const reassertLocked = () => {
     if (closed || broken) {
       throw new Error('bus is closed');
@@ -1053,16 +1295,12 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
       fenced = true;
       throw new Error('bus write ownership was taken over by another process');
     }
-    // A successful check at a phase boundary also pushes the heartbeat past
-    // the long fsync/rename that just completed.
     writeHeartbeat();
   };
 
   // Append a whole buffer to a file with its own short-lived append handle.
   // There is deliberately no shared fd: compact/truncate replace the log by
   // rename, and an old handle would keep writing to the replaced inode.
-  // `onProgress` (if given) fires between chunks so a long synchronous write
-  // can refresh the session heartbeat while the event loop is blocked.
   const appendTo = (file, buf, wantFsync, onProgress = null) => {
     const fd = openSync(file, 'a');
     try {
@@ -1089,9 +1327,6 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
     appendTo(logPath, Buffer.from(JSON.stringify(entry) + '\n', 'utf8'), wantFsync);
   };
 
-  // A failure to even take the mutex is contention, not a torn write: the
-  // instance stays usable and the call may be retried. Only a failure after
-  // the lock is held (an actual disk write) makes the bus `broken`.
   const isLockError = (err) =>
     err && typeof err.message === 'string' && err.message.startsWith('bus lock');
 
@@ -1100,12 +1335,13 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
   // credential, and the merged position map comes from the shared files.
   const persistPosition = (name, pos) => {
     try {
-      withOwnership((lease, scanned) => {
-        const st = prepareLocked(scanned);
-        writeEntry({ t: 'p', name, pos, g: epoch });
-        // Reflect locally without requiring a full rescan.
-        st.positions.set(name, pos);
-        absorb(st);
+      withOwnership(() => {
+        prepareMutationLocked();
+        const entry = { t: 'p', name, pos, g: epoch };
+        const json = JSON.stringify(entry) + '\n';
+        writeEntry(entry);
+        noteOwnAppendLocked([entry], Buffer.byteLength(json, 'utf8'));
+        absorb(view.st);
       });
     } catch (err) {
       if (!fenced && !isLockError(err)) broken = true;
@@ -1129,9 +1365,8 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
   };
 
   // Heartbeat: keep this session's heartbeat file fresh while the process
-  // is alive. It runs WITHOUT the mutex, so even a process blocked waiting
-  // for the lock is never mistaken for a dead holder. Takeover is detected
-  // on the next write attempt (the epoch check), not here.
+  // is alive. It runs WITHOUT the mutex. Takeover is detected on the next
+  // write attempt (the epoch check), not here.
   const renew = () => {
     if (closed) return;
     writeHeartbeat();
@@ -1141,10 +1376,374 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
 
   const bestEffortView = () => {
     try {
-      withLockSync(() => absorb(scanDirectory(dir)), VIEW_WAIT_MS);
+      withLockSync(() => {
+        reconcileLocked();
+        absorb(view.st);
+      }, VIEW_WAIT_MS);
     } catch {
       // Lock held by a writer right now: the cached view stays valid.
     }
+  };
+
+  // ---------------------------------------------------------------------
+  // Commit group execution
+  // ---------------------------------------------------------------------
+
+  // One planned record: either a reuse of an earlier (history or in-group)
+  // first acknowledgement, or a new effective message carrying its line.
+  // Reject one request (quota/IO/takeover/close): release its reservations
+  // and fail it. State was never applied on its account.
+  const rejectRequest = (req, err) => {
+    for (const [key, reservation] of req.reservations) {
+      const map = req.kind === 'single' ? pending : groupPending;
+      if (map.get(key) === reservation) map.delete(key);
+      reservation.reject(err);
+    }
+    req.reject(err);
+  };
+
+  // Settle accepted requests after the bracket is confirmed, plus the dedup
+  // reservations their calls registered (concurrent resends attach to
+  // those). Acknowledgements come from the planner's key->ack table; the
+  // request itself gets per-record acks in input order.
+  const settleAccepted = (accepted, ctx) => {
+    for (const { req } of accepted) {
+      for (const [key, reservation] of req.reservations) {
+        const map = req.kind === 'single' ? pending : groupPending;
+        if (map.get(key) === reservation) map.delete(key);
+        reservation.resolve(ctx.keyAcks.get(key));
+      }
+    }
+    for (const { req, items } of accepted) {
+      const acks = items.map((item) => (item.reuse ? item.reuse : item.effective));
+      req.resolve(req.kind === 'single' ? acks[0] : acks);
+    }
+  };
+
+  // Fail every accepted request (used for a write/fsync/takeover failure
+  // after planning but before confirmation).
+  const failAccepted = (accepted, err) => {
+    for (const { req } of accepted) rejectRequest(req, err);
+  };
+
+  const runCommitGroup = (reqs) => {
+    // Calls accepted during planning in this execution; read by the outer
+    // catch so a write/fsync/takeover failure fails only accepted calls
+    // (per-request quota rejections are already settled inside).
+    let accepted = [];
+    try {
+      if (closed || broken) throw new Error('bus is closed');
+      withOwnership(() => {
+        // Stage 1: ownership validated at the lock door; reconcile and heal
+        // any crash debris before a byte is planned.
+        const st = prepareMutationLocked();
+
+        // Boundary after heal/reconcile: a takeover landing while the lock
+        // was waited for invalidates the whole queued group up front.
+        reassertLocked();
+
+        // Stages 2+3: plan AND judge quota one request at a time, in
+        // invocation order. Each call keeps the standalone semantics: a
+        // single record or whole batch that does not fit rejects and
+        // allocates nothing, while fitting calls queued beside it still
+        // commit. Sequence numbers, the first-occurrence dedup overlay and
+        // running occupancy advance only for accepted calls, so the merged
+        // commit is byte-for-byte what serial commits would have produced.
+        let nextSeq = st.seq;
+        let used = st.usageBytes;
+        const owned = new Map(); // key -> first ack within accepted calls
+        const keyAcks = new Map();
+        const effectives = [];
+        accepted = [];
+
+        for (const req of reqs) {
+          // Pass 1: classify every prepared record as a reuse (history, an
+          // earlier accepted call, or the first occurrence within THIS call)
+          // or tentative-new, and measure the call's new occupancy. In-call
+          // duplicates are charged once (their first occurrence).
+          const newItems = []; // prepared records that would allocate a seq
+          const newIndexByPrepared = []; // -> index into newItems, or -1
+          const firstInCall = new Map(); // key -> index in newItems
+          let newBytes = 0;
+          let overflow = false;
+
+          for (const item of req.prepared) {
+            const key = item.dedupKey;
+            let isReuse =
+              key !== undefined &&
+              (st.dedup.has(key) || owned.has(key) || firstInCall.has(key));
+            if (isReuse) {
+              newIndexByPrepared.push(-1);
+              continue;
+            }
+            const idx = newItems.length;
+            newItems.push(item);
+            newIndexByPrepared.push(idx);
+            newBytes += item.size;
+            if (key !== undefined) firstInCall.set(key, idx);
+            if (quota !== undefined && used + newBytes > quota) overflow = true;
+          }
+
+          if (overflow) {
+            // The whole call rejects before a seq/key/byte is reserved; its
+            // new keys stay free for later calls.
+            rejectRequest(
+              req,
+              req.kind === 'batch'
+                ? new RangeError('publishBatch: retained bytes would exceed maxBytes')
+                : new RangeError('publish: retained bytes would exceed maxBytes'),
+            );
+            continue;
+          }
+
+          // Pass 2: accepted. Assign contiguous seqs to the new records and
+          // materialize their persisted lines and parsed entries.
+          const newEffs = [];
+          for (const item of newItems) {
+            const key = item.dedupKey;
+            nextSeq += 1;
+            const id = randomUUID();
+            const ack = { id, seq: nextSeq };
+            const entry = {
+              t: 'm',
+              seq: ack.seq,
+              id,
+              bytes: item.size,
+              g: epoch,
+              record: JSON.parse(item.recordJson),
+            };
+            if (key !== undefined) entry.d = key;
+            let line = `{"t":"m","seq":${ack.seq},"id":${JSON.stringify(id)},"bytes":${item.size},"g":${epoch}`;
+            if (key !== undefined) line += `,"d":${JSON.stringify(key)}`;
+            line += `,"record":${item.recordJson}}\n`;
+            const eff = { ack, size: item.size, key, line, entry };
+            newEffs.push(eff);
+            effectives.push(eff);
+            used += item.size;
+            if (key !== undefined) {
+              owned.set(key, ack);
+              keyAcks.set(key, ack);
+            }
+          }
+          // Build the per-record acknowledgements in input order.
+          const items = newIndexByPrepared.map((ni, pi) => {
+            if (ni >= 0) return { effective: newEffs[ni].ack };
+            const key = req.prepared[pi].dedupKey;
+            const hist = st.dedup.get(key);
+            const reuse = hist ? { id: hist.id, seq: hist.seq } : owned.get(key);
+            return { reuse };
+          });
+          // Ensure reservations/racers for history-reuse keys resolve too.
+          for (const item of req.prepared) {
+            const key = item.dedupKey;
+            if (key !== undefined && !keyAcks.has(key)) {
+              const hist = st.dedup.get(key);
+              if (hist) keyAcks.set(key, { id: hist.id, seq: hist.seq });
+            }
+          }
+          accepted.push({ req, items });
+        }
+
+        if (accepted.length === 0) {
+          // Every call was a quota rejection (or a pure dup that nonetheless
+          // is accepted above with zero effectives). Nothing to write.
+          return;
+        }
+
+        if (effectives.length === 0) {
+          // Every accepted call was a pure duplicate: nothing to write;
+          // first acknowledgements allocate no seq and no bytes.
+          absorb(st);
+          settleAccepted(accepted, { keyAcks });
+          return;
+        }
+
+        // Stage 4: one bracketed write covers all accepted calls. The
+        // records land first (chunked, with heartbeat/credential
+        // boundaries), the commit marker only after the records are
+        // flushed: a crash or a takeover in the window leaves an
+        // uncommitted bracket every reader/reopen severs wholesale, so a
+        // call's records are all-visible or invisible, never torn-applied.
+        const gid = randomUUID();
+        const beginJson = JSON.stringify({ t: 'b', id: gid, g: epoch }) + '\n';
+        const commitJson = JSON.stringify({ t: 'bk', id: gid, g: epoch }) + '\n';
+        const beginLine = Buffer.from(beginJson, 'utf8');
+        const commitLine = Buffer.from(commitJson, 'utf8');
+        // Exact physical bytes appended: begin bracket, every effective
+        // message line, and the commit bracket.
+        let appendedBytes = Buffer.byteLength(beginJson, 'utf8');
+        for (const eff of effectives) appendedBytes += Buffer.byteLength(eff.line, 'utf8');
+        appendedBytes += Buffer.byteLength(commitJson, 'utf8');
+        const CHUNK = 256;
+        let fd;
+        try {
+          fd = openSync(logPath, 'a');
+          const writeBuffer = (buf) => {
+            let off = 0;
+            while (off < buf.length) {
+              const written = writeSync(fd, buf, off, buf.length - off);
+              if (!Number.isInteger(written) || written <= 0) {
+                throw new Error('commit group: write made no progress');
+              }
+              off += written;
+            }
+          };
+          writeBuffer(beginLine);
+          for (let i = 0; i < effectives.length; i += CHUNK) {
+            const part = effectives.slice(i, i + CHUNK);
+            writeBuffer(Buffer.concat(part.map((eff) => Buffer.from(eff.line, 'utf8'))));
+            // Stage boundary inside a chunked oversized-group flush: refresh
+            // liveness AND re-validate the credential. A takeover found here
+            // aborts before the commit marker, so the open bracket is
+            // severable and the whole group stays unconfirmed.
+            reassertLocked();
+          }
+          // Final pre-commit boundary (also covers the single-chunk case).
+          reassertLocked();
+          // The commit marker closes the bracket; then ONE flush covers the
+          // entire merged group at once (its single durability point).
+          writeBuffer(commitLine);
+          if (fsync) fsyncSync(fd);
+          // Boundary after the commit flush.
+          reassertLocked();
+        } catch (err) {
+          if (fd !== undefined) {
+            try {
+              closeSync(fd);
+            } catch {
+              // Already closed.
+            }
+          }
+          // Write/flush failure or a mid-group takeover: state is untouched
+          // (nothing is applied until the commit is confirmed) and the
+          // uncommitted suffix is severed before the next append. Stop the
+          // instance so later writes cannot glue onto the partial group.
+          if (!fenced) broken = true;
+          throw err;
+        }
+        try {
+          closeSync(fd);
+        } catch {
+          // Already closed.
+        }
+
+        // Stage 5: confirmed. Fold THIS group's entries straight into the
+        // cached view and advance the consumed offset by the exact bytes
+        // appended — no positional re-read of bytes we just wrote. Bracket
+        // lines carry no state; only the effective message entries apply.
+        noteOwnAppendLocked(
+          effectives.map((eff) => eff.entry),
+          appendedBytes,
+        );
+        absorb(view.st);
+        settleAccepted(accepted, { keyAcks });
+      });
+    } catch (err) {
+      // The lock could not be taken (contention), the bus is closed, or a
+      // boundary/IO failure escaped the critical section. Per-request quota
+      // rejections were already delivered during planning; fail every call
+      // that had been accepted (or every call when planning never ran).
+      // Contention keeps the instance usable (the calls may be retried); a
+      // write/fsync failure or takeover already marked it broken/fenced.
+      if (accepted.length === 0) {
+        for (const req of reqs) rejectRequest(req, err);
+      } else {
+        failAccepted(accepted, err);
+      }
+    }
+  };
+
+  const pump = async () => {
+    try {
+      while (queue.length > 0) {
+        const head = queue[0];
+        if (head.kind === 'barrier') {
+          queue.shift();
+          await head.run();
+          continue;
+        }
+        if (closed || broken) {
+          // Writers queued ahead of a barrier never run once the bus is
+          // closing/broken; barriers still run (they self-check).
+          const reqs = [];
+          while (queue.length > 0 && isWriterRequest(queue[0])) reqs.push(queue.shift());
+          const err = new Error('bus is closed');
+          for (const req of reqs) {
+            for (const [key, reservation] of req.reservations) {
+              const map = req.kind === 'single' ? pending : groupPending;
+              if (map.get(key) === reservation) map.delete(key);
+              reservation.reject(err);
+            }
+            req.reject(err);
+          }
+          continue;
+        }
+        // Merge every writer request queued right now into one commit group.
+        const reqs = [];
+        while (queue.length > 0 && isWriterRequest(queue[0])) reqs.push(queue.shift());
+        runCommitGroup(reqs);
+      }
+    } finally {
+      pumping = false;
+      // A request may have landed while the loop was finishing; schedulePump
+      // calls from push() cover it, but re-check to close that race.
+      if (queue.length > 0) schedulePump();
+    }
+  };
+
+  function schedulePump() {
+    if (pumping || queue.length === 0) return;
+    pumping = true;
+    Promise.resolve().then(pump);
+  }
+
+  const enqueueWriter = (req) => {
+    queue.push(req);
+    schedulePump();
+    return req.promise;
+  };
+
+  const enqueueBarrier = (run) => {
+    const req = { kind: 'barrier', run };
+    queue.push(req);
+    schedulePump();
+  };
+
+  // Build one writer request's promise/reservation bookkeeping. The
+  // request's own promise resolves to an ack (single) or ack array (batch);
+  // each reserved dedup key additionally owns a SEPARATE promise that
+  // resolves to that key's first acknowledgement, because a concurrent
+  // single/batch racing the key attaches to it and the shapes differ.
+  const makeWriterRequest = (kind, prepared) => {
+    let resolveResult;
+    let rejectResult;
+    const promise = new Promise((resolve, reject) => {
+      resolveResult = resolve;
+      rejectResult = reject;
+    });
+    const req = { kind, prepared, reservations: new Map(), resolve: resolveResult, reject: rejectResult, promise };
+    // Reserve this request's first-occurrence keys at call time, mirroring
+    // the committed first-acknowledgement rule for concurrent resends.
+    for (const item of prepared) {
+      const key = item.dedupKey;
+      if (key === undefined || req.reservations.has(key)) continue;
+      if (dedup.has(key) || pending.has(key) || groupPending.has(key)) continue;
+      let resolveKey;
+      let rejectKey;
+      const keyPromise = new Promise((resolve, reject) => {
+        resolveKey = resolve;
+        rejectKey = reject;
+      });
+      // The coordination promise may reject (bus closed/fenced/takeover)
+      // with no racer attached; swallow that branch so the process does not
+      // surface an unhandled rejection. Real racers still observe it.
+      keyPromise.catch(() => {});
+      const reservation = { promise: keyPromise, resolve: resolveKey, reject: rejectKey };
+      req.reservations.set(key, reservation);
+      if (kind === 'single') pending.set(key, reservation);
+      else groupPending.set(key, reservation);
+    }
+    return req;
   };
 
   const bus = {
@@ -1164,7 +1763,8 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
       } catch (err) {
         return Promise.reject(err);
       }
-      const size = Buffer.byteLength(JSON.stringify(record), 'utf8');
+      const recordJson = JSON.stringify(record);
+      const size = Buffer.byteLength(recordJson, 'utf8');
 
       // Duplicate of an effective message seen by this instance (possibly
       // recovered from disk). Keys first published by another process miss
@@ -1184,89 +1784,8 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
         }
       }
 
-      // Reserve in-flight dedup at call time so concurrent resends of the
-      // same order share the first result; FIFO enqueue assigns seq in
-      // invocation order.
-      let resolveResult;
-      let rejectResult;
-      const promise = new Promise((resolve, reject) => {
-        resolveResult = resolve;
-        rejectResult = reject;
-      });
-      if (dedupKey !== undefined) {
-        pending.set(dedupKey, { promise, resolve: resolveResult, reject: rejectResult });
-      }
-
-      enqueue(() => {
-        if (closed || broken) {
-          throw new Error('bus is closed');
-        }
-        return withOwnership((lease, st0) => {
-          const st = prepareLocked(st0);
-
-          // The key may have landed from another process (or another
-          // session of this one) between the cache check and the lock:
-          // share that first acknowledgement byte-for-byte.
-          if (dedupKey !== undefined) {
-            const shared = st.dedup.get(dedupKey);
-            if (shared) {
-              dedup.set(dedupKey, { id: shared.id, seq: shared.seq });
-              absorb(st);
-              return { id: shared.id, seq: shared.seq, reused: true };
-            }
-          }
-
-          // Quota is judged inside the lock against the merged occupancy,
-          // so bytes another process committed count. An exact fit
-          // succeeds; one byte over (or one oversized record) rejects
-          // before anything is written — shared state stays untouched.
-          if (quota !== undefined && st.usageBytes + size > quota) {
-            absorb(st);
-            throw new RangeError('publish: retained bytes would exceed maxBytes');
-          }
-          const mySeq = st.seq + 1;
-          const id = randomUUID();
-          const entry = { t: 'm', seq: mySeq, id, bytes: size, g: epoch, record };
-          if (dedupKey !== undefined) entry.d = dedupKey;
-          try {
-            // Durable before acknowledgement: state changes only after the
-            // write (and optional fsync) succeeds.
-            appendTo(
-              logPath,
-              Buffer.from(JSON.stringify(entry) + '\n', 'utf8'),
-              fsync,
-            );
-          } catch (err) {
-            broken = true;
-            throw err;
-          }
-          // Defense in depth: confirm the credential still holds after the
-          // write completes. A live job's heartbeat cannot go stale, so this
-          // only trips under tampering; on the rare race the caller sees a
-          // rejection and the stamped line is filtered by the fence anyway.
-          reassertLocked();
-          // Apply to the merged view and cache it.
-          st.seq = mySeq;
-          st.bytes += size;
-          st.usageBytes += size;
-          st.published += 1;
-          if (dedupKey !== undefined) st.dedup.set(dedupKey, { id, seq: mySeq });
-          absorb(st);
-          return { id, seq: mySeq, reused: false };
-        });
-      }).then(
-        (ack) => {
-          const clean = { id: ack.id, seq: ack.seq };
-          if (dedupKey !== undefined) pending.delete(dedupKey);
-          resolveResult(clean);
-        },
-        (err) => {
-          if (dedupKey !== undefined) pending.delete(dedupKey);
-          rejectResult(err);
-        },
-      );
-
-      return promise;
+      const req = makeWriterRequest('single', [{ dedupKey, recordJson, size }]);
+      return enqueueWriter(req);
     },
 
     publishBatch(records) {
@@ -1279,9 +1798,7 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
       }
 
       // Validate and serialize every record up front. Any single bad shape
-      // (or value JSON cannot carry) rejects the whole group before the
-      // lock is touched: seq/bytes/published/dedup/positions stay exactly
-      // as they were.
+      // rejects the whole group before the pipeline is touched.
       const prepared = [];
       try {
         for (const record of records) {
@@ -1293,8 +1810,6 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
             throw new TypeError('publishBatch: dedupKey must be a string');
           }
           assertJsonSafe(record);
-          // Serialize exactly once per record: the byte count used for
-          // stats and the bytes actually appended must be the same string.
           const recordJson = JSON.stringify(record);
           prepared.push({
             dedupKey,
@@ -1309,180 +1824,8 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
         return Promise.resolve([]);
       }
 
-      // Reserve the group's first-occurrence keys at call time, mirroring
-      // publish()'s `pending`: a concurrent single or batch carrying the
-      // same key shares this group's first acknowledgement. Keys already in
-      // history or reserved by an earlier in-flight op are left alone.
-      const reservations = new Map();
-      for (const item of prepared) {
-        const key = item.dedupKey;
-        if (key === undefined) continue;
-        if (dedup.has(key) || pending.has(key) || groupPending.has(key)) continue;
-        if (reservations.has(key)) continue;
-        let resolveResult;
-        let rejectResult;
-        const promise = new Promise((resolve, reject) => {
-          resolveResult = resolve;
-          rejectResult = reject;
-        });
-        // This promise is a coordination primitive: callers that race the
-        // reservation attach their own branch (publish returns it). A group
-        // with no such racer would otherwise leave the rejection unhandled
-        // when the bus closes before the job runs. The noop branch only
-        // handles the event for the process; racers still observe it.
-        promise.catch(() => {});
-        const reservation = { promise, resolve: resolveResult, reject: rejectResult };
-        reservations.set(key, reservation);
-        groupPending.set(key, reservation);
-      }
-
-      return enqueue(() => {
-        if (closed || broken) {
-          throw new Error('bus is closed');
-        }
-        return withOwnership((lease, st0) => {
-          const st = prepareLocked(st0);
-
-          // Resolve the whole plan against the merged durable state inside
-          // the locked job, so groups queued behind any writer's publishes
-          // observe committed dedup keys from every process.
-          const gid = randomUUID();
-          let nextSeq = st.seq;
-          let effectiveBytes = 0;
-          const owned = new Map(); // key -> first acknowledgement within group
-          const keyAcks = new Map(); // every dedup key's resolved acknowledgement
-          const planned = prepared.map((item) => {
-            const key = item.dedupKey;
-            if (key !== undefined) {
-              const hist = st.dedup.get(key);
-              if (hist) {
-                const reuse = { id: hist.id, seq: hist.seq };
-                keyAcks.set(key, reuse);
-                return { reuse };
-              }
-              const earlier = owned.get(key);
-              if (earlier) {
-                return { reuse: earlier };
-              }
-            }
-            nextSeq += 1;
-            const id = randomUUID();
-            const ack = { id, seq: nextSeq };
-            if (key !== undefined) {
-              owned.set(key, ack);
-              keyAcks.set(key, ack);
-            }
-            // Splice the already-serialized record into the line so the
-            // persisted bytes are exactly what `size` counted.
-            let line = `{"t":"m","seq":${nextSeq},"id":${JSON.stringify(id)},"bytes":${item.size},"g":${epoch}`;
-            if (key !== undefined) line += `,"d":${JSON.stringify(key)}`;
-            line += `,"record":${item.recordJson}}\n`;
-            effectiveBytes += item.size;
-            return { effective: { ack, line, size: item.size, key } };
-          });
-
-          // Shape validation happened at call time; quota is judged for the
-          // whole group here against merged occupancy, counting only the
-          // first occurrence of each key. One byte over rejects the entire
-          // group before the bracket is opened — no seq, stat or file change
-          // anywhere in the shared directory.
-          if (quota !== undefined && st.usageBytes + effectiveBytes > quota) {
-            absorb(st);
-            throw new RangeError('publishBatch: retained bytes would exceed maxBytes');
-          }
-
-          // One begin-bracket, the group's new messages, one commit-bracket.
-          // Recovery applies the bracketed entries only when the commit is
-          // present, so a crash leaves no trace of the group.
-          const buffers = [
-            Buffer.from(JSON.stringify({ t: 'b', id: gid, g: epoch }) + '\n', 'utf8'),
-          ];
-          for (const part of planned) {
-            if (part.effective) {
-              buffers.push(Buffer.from(part.effective.line, 'utf8'));
-            }
-          }
-          buffers.push(
-            Buffer.from(JSON.stringify({ t: 'bk', id: gid, g: epoch }) + '\n', 'utf8'),
-          );
-
-          // Everything is written through one append handle, synchronously,
-          // while the cross-process lock is held: no position line or other
-          // writer can interleave. Single-buffer writeSync in chunks behaves
-          // identically on Windows.
-          const fd = openSync(logPath, 'a');
-          try {
-            const writeBuffer = (buf) => {
-              let off = 0;
-              while (off < buf.length) {
-                const written = writeSync(fd, buf, off, buf.length - off);
-                if (!Number.isInteger(written) || written <= 0) {
-                  throw new Error('publishBatch: write made no progress, group is not durable');
-                }
-                off += written;
-              }
-            };
-            const CHUNK = 256;
-            for (let i = 0; i < buffers.length; i += CHUNK) {
-              writeBuffer(Buffer.concat(buffers.slice(i, i + CHUNK)));
-              // A long synchronous group blocks the event loop; refresh the
-              // heartbeat here so no waiter mistakes this holder for dead.
-              writeHeartbeat();
-            }
-            if (fsync) fsyncSync(fd);
-          } catch (err) {
-            try {
-              closeSync(fd);
-            } catch {
-              // Already closed.
-            }
-            // Nothing is applied in memory; the uncommitted bracket is
-            // severed on reopen/heal. Stop the instance so later writes
-            // cannot glue themselves onto the partial group.
-            broken = true;
-            throw err;
-          }
-          try {
-            closeSync(fd);
-          } catch {
-            // Already closed.
-          }
-          // Same post-write credential check as single publish.
-          reassertLocked();
-
-          // Durable first, state after.
-          for (const part of planned) {
-            if (!part.effective) continue;
-            const { ack, size, key } = part.effective;
-            st.seq = ack.seq;
-            st.bytes += size;
-            st.usageBytes += size;
-            st.published += 1;
-            if (key !== undefined) st.dedup.set(key, { id: ack.id, seq: ack.seq });
-          }
-          absorb(st);
-
-          const acks = planned.map((part) =>
-            part.reuse
-              ? { id: part.reuse.id, seq: part.reuse.seq }
-              : { id: part.effective.ack.id, seq: part.effective.ack.seq },
-          );
-          for (const [key, reservation] of reservations) {
-            groupPending.delete(key);
-            reservation.resolve(keyAcks.get(key));
-          }
-          return acks;
-        });
-      }).catch((err) => {
-        // Covers write failure inside the job and rejection before the job
-        // body (closed/broken/fenced bus): release any reservation still
-        // pointing at this failed group.
-        for (const [key, reservation] of reservations) {
-          if (groupPending.get(key) === reservation) groupPending.delete(key);
-          reservation.reject(err);
-        }
-        throw err;
-      });
+      const req = makeWriterRequest('batch', prepared);
+      return enqueueWriter(req);
     },
 
     replay(from = 0) {
@@ -1493,31 +1836,39 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
         return Promise.reject(new RangeError('replay: from must be a non-negative integer'));
       }
 
-      return enqueue(() => {
-        if (closed || broken) {
-          throw new Error('bus is closed');
-        }
-        return withOwnership((lease, st0) => {
-          const st = prepareLocked(st0);
-          // replay(from) is inclusive of from; messagesAfter takes an
-          // exclusive lower bound.
-          const out = messagesAfter(st, from - 1);
-          const n = out.length;
-          if (n > 0) {
-            try {
-              writeEntry({ t: 's', n, g: epoch });
-            } catch (err) {
-              broken = true;
-              throw err;
-            }
-            st.replayed += n;
-            absorb(st);
-          } else {
-            absorb(st);
+      const result = new Promise((resolve, reject) => {
+        enqueueBarrier(() => {
+          try {
+            if (closed || broken) throw new Error('bus is closed');
+            withOwnership(() => {
+              const st = prepareMutationLocked();
+              // replay(from) is inclusive of from; messagesAfter takes an
+              // exclusive lower bound.
+              const out = messagesAfter(st, from - 1);
+              const n = out.length;
+              if (n > 0) {
+                try {
+                  const entry = { t: 's', n, g: epoch };
+                  const json = JSON.stringify(entry) + '\n';
+                  writeEntry(entry);
+                  noteOwnAppendLocked([entry], Buffer.byteLength(json, 'utf8'));
+                } catch (err) {
+                  broken = true;
+                  throw err;
+                }
+                absorb(view.st);
+              } else {
+                absorb(st);
+              }
+              resolve(out);
+            });
+          } catch (err) {
+            if (!fenced && !isLockError(err) && !closed) broken = true;
+            reject(err);
           }
-          return out;
         });
       });
+      return result;
     },
 
     register(name) {
@@ -1529,9 +1880,9 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
       let current;
       try {
         current = withOwnership(
-          (lease, st) => {
-            const value = st.positions.get(name);
-            absorb(st);
+          () => {
+            const value = view.st.positions.get(name);
+            absorb(view.st);
             return value;
           },
           { readonly: true },
@@ -1540,7 +1891,6 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
         if (!fenced && !isLockError(err)) broken = true;
         throw err;
       }
-      // Re-registering an existing name must not reset its position.
       if (current !== undefined) {
         return current;
       }
@@ -1563,9 +1913,9 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
       let current;
       try {
         current = withOwnership(
-          (lease, st) => {
-            const value = st.positions.get(name);
-            absorb(st);
+          () => {
+            const value = view.st.positions.get(name);
+            absorb(view.st);
             return value;
           },
           { readonly: true },
@@ -1599,9 +1949,9 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
       let pos;
       try {
         withOwnership(
-          (lease, view) => {
-            st = view;
-            pos = view.positions.get(name);
+          () => {
+            st = view.st;
+            pos = view.st.positions.get(name);
           },
           { readonly: true },
         );
@@ -1610,9 +1960,9 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
         throw err;
       }
       if (pos === undefined) {
-        // Persists a position line, so it validates the credential.
         persistPosition(name, 0);
         pos = 0;
+        st = view.st;
         st.positions.set(name, 0);
         absorb(st);
       } else {
@@ -1626,126 +1976,106 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
       if (closed) {
         return Promise.reject(new Error('bus is closed'));
       }
-      return enqueue(() => {
-        if (closed || broken) {
-          throw new Error('bus is closed');
-        }
-        withOwnership((lease, st0) => {
-          // Credential validated at the lock door; heal any interrupted
-          // earlier compact/truncate before starting this one.
-          const st = prepareLocked(st0);
-
-          // Fold every surviving message: snapshot contents plus the live
-          // log, skipping anything truncation already discarded.
-          const messages = [];
-          for (const m of st.baseMessages) {
-            if (m.seq > st.horizon) messages.push(m);
-          }
-          for (const m of st.live) {
-            if (m.seq > st.horizon) {
-              messages.push({ seq: m.seq, id: m.id, record: structuredClone(m.record) });
-            }
-          }
-          messages.sort((a, b) => a.seq - b.seq);
-          const gen = st.snapshotGen + 1;
-          const scopedSnapshotPath = path.join(dir, snapshotScopedName(gen, epoch));
-          const snapshotTmpMine = path.join(
-            dir,
-            `bus.snapshot.tmp.${process.pid}.${sessionId.slice(0, 8)}`,
-          );
-          const logTmpMine = path.join(
-            dir,
-            `bus.log.tmp.${process.pid}.${sessionId.slice(0, 8)}`,
-          );
-          const snapshot = {
-            v: 1,
-            gen,
-            e: epoch,
-            seq: st.seq,
-            bytes: st.bytes,
-            published: st.published,
-            replayed: st.replayed,
-            horizon: st.horizon,
-            positions: Object.fromEntries(st.positions),
-            dedup: Array.from(st.dedup.entries()),
-            messages,
-          };
-          // The snapshot is durable (fsync + atomic rename) before the log
-          // is truncated, so a crash anywhere leaves either the intact old
-          // log (half tmp snapshot, discarded on reopen) or the new
-          // marker-led log — never something in between. It lands at a
-          // gen/epoch-scoped name first: a preempted holder finishing a
-          // frozen compaction cannot overwrite the current owner's
-          // snapshot, and recovery simply ignores its older-epoch orphan.
-          writeHeartbeat();
-          const tmpFd = openSync(snapshotTmpMine, 'w');
+      return new Promise((resolve, reject) => {
+        enqueueBarrier(() => {
           try {
-            writeSync(tmpFd, Buffer.from(JSON.stringify(snapshot) + '\n', 'utf8'));
-            fsyncSync(tmpFd);
-          } finally {
-            closeSync(tmpFd);
-          }
-          renameSync(snapshotTmpMine, scopedSnapshotPath);
-          syncDirBestEffort();
-          writeHeartbeat();
-          // Re-verify before the destructive half of the compaction. A
-          // stale holder stops here: its scoped snapshot is an orphan the
-          // next scan removes, and it never touches the canonical file, the
-          // segments or the live log.
-          reassertLocked();
-          // Mirror to the canonical name only while ownership is current,
-          // so legacy/hand-crafted layouts and any external reader still
-          // see bus.snapshot.json. Uses a session-scoped tmp for the same
-          // non-clobbering reason.
-          const canonTmp = path.join(
-            dir,
-            `bus.snapshot.mirror.tmp.${process.pid}.${sessionId.slice(0, 8)}`,
-          );
-          const canonFd = openSync(canonTmp, 'w');
-          try {
-            writeSync(canonFd, readFileSync(scopedSnapshotPath));
-            fsyncSync(canonFd);
-          } finally {
-            closeSync(canonFd);
-          }
-          renameSync(canonTmp, snapshotPath);
+            if (closed || broken) throw new Error('bus is closed');
+            withOwnership(() => {
+              const st = prepareMutationLocked();
 
-          // Every finalized segment is folded into the snapshot; drop
-          // them. Deletion is unconditional: a failed unlink leaves only a
-          // harmless leftover (the foldedSeq floor keeps it out of replay;
-          // the next heal/reopen removes it).
-          for (const seg of listSegments(dir)) {
-            try {
-              rmSync(seg.path, { force: true });
-            } catch {
-              // Leftover segment: ignored now, cleaned up later.
-            }
-          }
-          // The fresh log leads with the compact marker and, when a
-          // takeover has ever fenced this directory, a fence line carrying
-          // the current watermark: replacing the log must not erase the
-          // barrier, or a preempted holder's later append would be accepted.
-          let head = st.markerLine(gen);
-          if (st.fenceEpoch > 0) head += JSON.stringify({ t: 'f', g: st.fenceEpoch }) + '\n';
-          const newFd = openSync(logTmpMine, 'w');
-          try {
-            writeSync(newFd, Buffer.from(head, 'utf8'));
-            fsyncSync(newFd);
-          } finally {
-            closeSync(newFd);
-          }
-          // Final ownership check immediately before the live log is
-          // replaced: no preempted holder may swap its (older-generation)
-          // marker log over the current one.
-          reassertLocked();
-          renameSync(logTmpMine, logPath);
-          syncDirBestEffort();
+              // Fold every surviving message: snapshot contents plus the
+              // live log, skipping anything truncation already discarded.
+              const messages = [];
+              for (const m of st.baseMessages) {
+                if (m.seq > st.horizon) messages.push(m);
+              }
+              for (const m of st.live) {
+                if (m.seq > st.horizon) {
+                  messages.push({ seq: m.seq, id: m.id, record: structuredClone(m.record) });
+                }
+              }
+              messages.sort((a, b) => a.seq - b.seq);
+              const gen = st.snapshotGen + 1;
+              const scopedSnapshotPath = path.join(dir, snapshotScopedName(gen, epoch));
+              const snapshotTmpMine = path.join(
+                dir,
+                `bus.snapshot.tmp.${process.pid}.${sessionId.slice(0, 8)}`,
+              );
+              const logTmpMine = path.join(
+                dir,
+                `bus.log.tmp.${process.pid}.${sessionId.slice(0, 8)}`,
+              );
+              const snapshot = {
+                v: 1,
+                gen,
+                e: epoch,
+                seq: st.seq,
+                bytes: st.bytes,
+                published: st.published,
+                replayed: st.replayed,
+                horizon: st.horizon,
+                positions: Object.fromEntries(st.positions),
+                dedup: Array.from(st.dedup.entries()),
+                messages,
+              };
+              writeHeartbeat();
+              const tmpFd = openSync(snapshotTmpMine, 'w');
+              try {
+                writeSync(tmpFd, Buffer.from(JSON.stringify(snapshot) + '\n', 'utf8'));
+                fsyncSync(tmpFd);
+              } finally {
+                closeSync(tmpFd);
+              }
+              renameSync(snapshotTmpMine, scopedSnapshotPath);
+              syncDirBestEffort();
+              writeHeartbeat();
+              // Re-verify before the destructive half of the compaction.
+              reassertLocked();
+              const canonTmp = path.join(
+                dir,
+                `bus.snapshot.mirror.tmp.${process.pid}.${sessionId.slice(0, 8)}`,
+              );
+              const canonFd = openSync(canonTmp, 'w');
+              try {
+                writeSync(canonFd, readFileSync(scopedSnapshotPath));
+                fsyncSync(canonFd);
+              } finally {
+                closeSync(canonFd);
+              }
+              renameSync(canonTmp, snapshotPath);
 
-          // Refresh the cache from the settled directory and let the scan
-          // physically reclaim superseded scoped snapshots it flags.
-          const settled = scanDirectory(dir);
-          healLocked(settled);
-          absorb(scanDirectory(dir));
+              for (const seg of listSegments(dir)) {
+                try {
+                  rmSync(seg.path, { force: true });
+                } catch {
+                  // Leftover segment: ignored now, cleaned up later.
+                }
+              }
+              let head = st.markerLine(gen);
+              if (st.fenceEpoch > 0) head += JSON.stringify({ t: 'f', g: st.fenceEpoch }) + '\n';
+              const newFd = openSync(logTmpMine, 'w');
+              try {
+                writeSync(newFd, Buffer.from(head, 'utf8'));
+                fsyncSync(newFd);
+              } finally {
+                closeSync(newFd);
+              }
+              // Final ownership check immediately before replacing the log.
+              reassertLocked();
+              renameSync(logTmpMine, logPath);
+              syncDirBestEffort();
+
+              // Structural change: rebuild the view from the new layout and
+              // let the scan reclaim superseded scoped snapshots.
+              invalidateViewLocked();
+              healLocked(view.st);
+              absorb(invalidateViewLocked());
+            });
+            resolve();
+          } catch (err) {
+            if (!fenced && !isLockError(err) && !closed) broken = true;
+            reject(err);
+          }
         });
       });
     },
@@ -1760,153 +2090,127 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
         return Promise.reject(new Error('bus is closed'));
       }
       if (before === 0) {
-        // A zero bound discards nothing by definition.
         return Promise.resolve();
       }
-      return enqueue(() => {
-        if (closed || broken) {
-          throw new Error('bus is closed');
-        }
-        withOwnership((lease, st0) => {
-          // Credential validated before the seal; the whole truncation is
-          // one locked critical section.
-          let st = prepareLocked(st0);
+      return new Promise((resolve, reject) => {
+        enqueueBarrier(() => {
+          try {
+            if (closed || broken) throw new Error('bus is closed');
+            withOwnership(() => {
+              let st = prepareMutationLocked();
 
-          // Truncation deals in whole segments only: seal the active
-          // segment so its contents become eligible, and roll a fresh one.
-          // The rename is atomic, so a crash here leaves the content under
-          // exactly one name — never duplicated, never half moved.
-          if (existsSync(logPath) && statSync(logPath).size > 0) {
-            // A preempted holder frozen at the start of the critical
-            // section must not seal the active log the new owner is about to
-            // create: re-verify immediately before the rename.
-            reassertLocked();
-            const sealedName = path.join(dir, segmentName(st.nextSegmentIndex));
-            renameSync(logPath, sealedName);
-          }
-          // The seal is the point of no return for this truncation: a
-          // preempted holder frozen across a takeover must not proceed to
-          // write a stale checkpoint into the fresh active log the new
-          // owner already created.
-          reassertLocked();
+              // Truncation deals in whole segments only: seal the active
+              // segment so its contents become eligible, and roll a fresh
+              // one. Re-verify immediately before the rename so a preempted
+              // holder cannot seal the new owner's active log.
+              if (existsSync(logPath) && statSync(logPath).size > 0) {
+                reassertLocked();
+                const sealedName = path.join(dir, segmentName(st.nextSegmentIndex));
+                renameSync(logPath, sealedName);
+              }
+              reassertLocked();
 
-          // Deletion is a prefix of the segment chain: sweep oldest first
-          // and stop at the first segment that must stay. A segment stays
-          // while any registered consumer's position has not passed its
-          // newest message, or while that message is beyond the bound. A
-          // segment without messages carries no retention weight and goes
-          // with the prefix (its position/stat lines are checkpointed
-          // below).
-          const doomed = [];
-          let newHorizon = st.horizon;
-          for (const seg of listSegments(dir)) {
-            const max = segmentMaxSeq(seg.path);
-            if (max !== null) {
-              if (max <= st.foldedSeq) continue; // pre-compaction leftover, not truncation's job
-              if (max > before) break;
-              let held = false;
-              for (const pos of st.positions.values()) {
-                if (pos < max) {
-                  held = true;
-                  break;
+              // Deletion is a prefix of the segment chain: sweep oldest
+              // first and stop at the first segment that must stay.
+              const doomed = [];
+              let newHorizon = st.horizon;
+              for (const seg of listSegments(dir)) {
+                const max = segmentMaxSeq(seg.path);
+                if (max !== null) {
+                  if (max <= st.foldedSeq) continue; // pre-compaction leftover
+                  if (max > before) break;
+                  let held = false;
+                  for (const pos of st.positions.values()) {
+                    if (pos < max) {
+                      held = true;
+                      break;
+                    }
+                  }
+                  if (held) break;
+                  if (max > newHorizon) newHorizon = max;
+                }
+                doomed.push(seg);
+              }
+              if (doomed.length === 0) {
+                // The roll above is the only effect; no marker is written.
+                invalidateViewLocked();
+                absorb(view.st);
+                return;
+              }
+
+              // Checkpoint every state the doomed segments carry BEFORE
+              // unlinking them. The marker is the fresh active segment's
+              // first line and becomes the new recovery anchor.
+              const marker = {
+                t: 't',
+                gen: st.snapshotGen,
+                horizon: newHorizon,
+                seq: st.seq,
+                bytes: st.bytes,
+                published: st.published,
+                replayed: st.replayed,
+                positions: Object.fromEntries(st.positions),
+                dedup: Array.from(st.dedup.entries()),
+              };
+              const markerFd = openSync(logPath, 'a');
+              try {
+                writeSync(markerFd, Buffer.from(JSON.stringify(marker) + '\n', 'utf8'));
+                if (st.fenceEpoch > 0) {
+                  writeSync(
+                    markerFd,
+                    Buffer.from(JSON.stringify({ t: 'f', g: st.fenceEpoch }) + '\n', 'utf8'),
+                  );
+                }
+                // Always fsync here regardless of the fsync option.
+                fsyncSync(markerFd);
+              } catch (err) {
+                try {
+                  closeSync(markerFd);
+                } catch {
+                  // Already closed.
+                }
+                broken = true;
+                throw err;
+              }
+              try {
+                closeSync(markerFd);
+              } catch {
+                // Already closed.
+              }
+              reassertLocked();
+              syncDirBestEffort();
+              for (const seg of doomed) {
+                try {
+                  rmSync(seg.path, { force: true });
+                } catch {
+                  // Leftovers are filtered by the horizon and cleaned on
+                  // the next heal/reopen.
                 }
               }
-              if (held) break;
-              if (max > newHorizon) newHorizon = max;
-            }
-            doomed.push(seg);
-          }
-          // Nothing can go: the roll above (if any) is the only effect.
-          // Write no marker; the fresh active log stays empty.
-          if (doomed.length === 0) {
-            absorb(scanDirectory(dir));
-            return;
-          }
+              syncDirBestEffort();
 
-          // Checkpoint every state the doomed segments carry BEFORE
-          // unlinking them. The marker is the first line of the fresh
-          // active segment and becomes the new recovery anchor, so a crash
-          // after it lands loses nothing: recovery resets to the marker and
-          // reconciles leftovers.
-          const marker = {
-            t: 't',
-            gen: st.snapshotGen,
-            horizon: newHorizon,
-            seq: st.seq,
-            bytes: st.bytes,
-            published: st.published,
-            replayed: st.replayed,
-            positions: Object.fromEntries(st.positions),
-            dedup: Array.from(st.dedup.entries()),
-          };
-          const markerFd = openSync(logPath, 'a');
-          try {
-            writeSync(markerFd, Buffer.from(JSON.stringify(marker) + '\n', 'utf8'));
-            // The barrier must survive the segment seal/deletion: the
-            // doomed sealed segments may be the only files carrying the
-            // current watermark, so re-stamp it in the fresh active log,
-            // immediately after its anchor marker.
-            if (st.fenceEpoch > 0) {
-              writeSync(
-                markerFd,
-                Buffer.from(JSON.stringify({ t: 'f', g: st.fenceEpoch }) + '\n', 'utf8'),
-              );
-            }
-            // Always fsync here regardless of the fsync option: deletion is
-            // only safe once the checkpoint is durable.
-            fsyncSync(markerFd);
+              // Structural change: rebuild merged state (usage now reflects
+              // freed segments, including snapshot-folded bytes the new
+              // horizon covers); the cumulative counters stay put.
+              invalidateViewLocked();
+              absorb(view.st);
+            });
+            resolve();
           } catch (err) {
-            try {
-              closeSync(markerFd);
-            } catch {
-              // Already closed.
-            }
-            broken = true;
-            throw err;
+            if (!fenced && !isLockError(err) && !closed) broken = true;
+            reject(err);
           }
-          try {
-            closeSync(markerFd);
-          } catch {
-            // Already closed.
-          }
-          // Checkpoint durable; re-verify before unlinking segments.
-          reassertLocked();
-          // Best-effort durability of the roll's and marker's directory
-          // entries before unlinking. Segment deletion is UNCONDITIONAL:
-          // a platform without directory fsync must not keep doomed
-          // segments forever. A crash here recovers to the marker plus
-          // whichever unlinks landed — both consistent.
-          syncDirBestEffort();
-          for (const seg of doomed) {
-            try {
-              rmSync(seg.path, { force: true });
-            } catch {
-              // Leftovers are filtered by the horizon and cleaned on the
-              // next heal/reopen.
-            }
-          }
-          syncDirBestEffort();
-
-          // Refresh authoritative state from disk; usage now reflects the
-          // freed segments (and any snapshot-folded bytes the new horizon
-          // covers). The cumulative stats bytes/published stay put by
-          // construction — only the marker carries them.
-          st = scanDirectory(dir);
-          absorb(st);
         });
       });
     },
 
     stats() {
-      // Reading the merged counters is allowed even after a takeover: only
-      // writes/truncation are fenced. After close the last cache stands.
+      // Reading the merged counters is allowed even after a takeover; after
+      // close the last cache stands.
       if (!closed) bestEffortView();
       return { seq, bytes, published, replayed };
     },
 
-    // Business bytes of the messages still retained (not yet discarded by
-    // retention truncation). Compaction does not change it; an empty bus is
-    // zero. Merged across writers. Readable after close, like stats().
     usage() {
       if (!closed) bestEffortView();
       return usageBytes;
@@ -1923,35 +2227,44 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
         p.reject(new Error('bus is closed'));
         pending.delete(key);
       }
-      // And every reservation held by a batch still waiting in the chain.
       for (const [key, g] of groupPending) {
         g.reject(new Error('bus is closed'));
         groupPending.delete(key);
       }
-      return enqueue(() => {
-        // Drop this session from the shared lease and remove its heartbeat
-        // file. With no live sessions left remove the lease file so the
-        // next opener starts clean; the epoch high-water file stays, so the
-        // epoch still never repeats.
-        try {
-          withLockSync(() => {
-            rmSync(heartbeatPath, { force: true });
-            const lease = readLeaseLocked();
-            if (!lease) return;
-            const sessions = lease.sessions.filter((s) => s.id !== sessionId);
-            if (sessions.length === 0) {
-              rmSync(ownerPath, { force: true });
-            } else {
-              writeLeaseLocked({ epoch: lease.epoch, sessions });
-            }
-          }, VIEW_WAIT_MS * 10);
-        } catch {
-          // Closing never rejects: the lease heartbeat expiry reclaims the
-          // session even if the lock cannot be taken right now.
-        }
+      return new Promise((resolve) => {
+        enqueueBarrier(() => {
+          try {
+            withLockSync(() => {
+              rmSync(heartbeatPath, { force: true });
+              const lease = readLeaseLocked();
+              if (!lease) return;
+              const sessions = lease.sessions.filter((s) => s.id !== sessionId);
+              if (sessions.length === 0) {
+                rmSync(ownerPath, { force: true });
+              } else {
+                writeLeaseLocked({ epoch: lease.epoch, sessions });
+              }
+            }, VIEW_WAIT_MS * 10);
+          } catch {
+            // Closing never rejects: heartbeat expiry reclaims the session.
+          }
+          resolve();
+        });
       });
     },
   };
+
+  // Prime the cache from the shared directory before createBus returns, so
+  // stats() is correct immediately (single-process behaviour).
+  try {
+    withLockSync(() => {
+      reconcileLocked();
+      absorb(view.st);
+    }, VIEW_WAIT_MS * 10);
+  } catch {
+    // Another writer holds the lock for long: cache stays zero and the
+    // first operation reconciles under the lock.
+  }
 
   return bus;
 }
