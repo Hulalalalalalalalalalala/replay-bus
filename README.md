@@ -1,6 +1,6 @@
 # replay-bus
 
-Append-only message bus for one process: every publish is durable before it is acknowledged, and a replay from a sequence number never repeats a message twice.
+Append-only message bus: every publish is durable before it is acknowledged, and a replay from a sequence number never repeats a message twice. The same bus directory may be opened and written by **multiple processes at once**: writers coordinate through files in the directory, and ownership carries an epoch credential that increments on every takeover, so a displaced writer can never mix bytes back into the log.
 
 ## Requirements
 
@@ -30,18 +30,32 @@ Node.js 20 or newer. No runtime dependencies.
 - `Bus.stats() -> { seq, bytes, published, replayed }`.
 - `Bus.close() -> Promise<void>` — idempotent.
 
-Unknown consumer names are auto-registered by `advance`/`read` exactly as if `register` had been called first. Positions, the dedup table and stats survive restarts; a crash anywhere inside `compact` (half-written snapshot, torn log tail) or inside a batch (a half-written group bracket) recovers to a consistent state with no lost or duplicated messages. The post-compaction log is replaced via a synced temp file plus an atomic rename (rather than truncating an open append handle), so compaction also works on Windows; a failed directory sync along the way only weakens the durability guarantee, it never fails the compaction or blocks the bus.
+Unknown consumer names are auto-registered by `advance`/`read` exactly as if `register` had been called first. Positions, the dedup table and stats survive restarts; a crash anywhere inside `compact` (half-written snapshot, torn log tail) or inside a batch (a half-written group bracket) recovers to a consistent state with no lost or duplicated messages. The post-compaction log is replaced via a synced temp file plus an atomic rename (rather than truncating an open append handle), so compaction also works on Windows; a failed directory sync along the way only weakens the durability guarantee, it never fails the compaction or blocks the bus. Segment files are always deleted unconditionally once their checkpoint is durable; the directory sync after an unlink is best-effort and its failure never skips the delete or blocks the bus.
+
+## Multiple processes
+
+One bus directory may be opened by several processes at the same time. `createBus` returns synchronously after acquiring write ownership; coordination is entirely file-based and needs no broker.
+
+- **Lease and epoch credential.** On open a process joins the live lease if a heartbeat-fresh holder exists, or otherwise takes over. Every takeover increments the epoch (persisted in `bus.epoch`, so it is never reused across restarts) and stamps an epoch barrier (`{t:'f'}`) into the log. A per-session heartbeat file is refreshed without holding the mutex, even while a process waits for the write lock.
+- **One mutation order.** Every append, batch, truncate and compaction takes a short-lived directory mutex (`bus.lock`) while it actually writes, so bytes from two processes can never interleave in a file. Each log line carries the writing epoch. Before any publish, batch, replay marker, position, truncate or compaction touches disk, the epoch credential is re-validated inside the lock, with further checks at multi-phase boundaries.
+- **Fencing.** If ownership is taken over, the old instance rejects every subsequent write, batch and `truncate` with an `Error` (rejected `Promise` for the async methods, thrown `Error` for synchronous position writes). Any bytes a displaced holder still manages to land physically appear after the barrier stamped with its smaller epoch and are invisible to every reader — they never enter counters, positions, the dedup table or the visible log, and they leave no gap in the sequence. Reads and the read-only position lookups keep working.
+- **Shared state.** Dedup keys, consumer positions, the retained-byte occupancy and the four cumulative counters are one merged state: the same `dedupKey` sent from a different process (or after restart) still returns the first acknowledgement once, positions advanced by two processes obey the no-backwards rule together, `maxBytes` is judged against the bytes committed by every writer (an over-quota record or whole group is rejected with state untouched), and `stats()`/`usage()` reflect the merge. The four cumulative counters are monotone across writers, takeovers and restarts.
+- **Recovery after a dead holder.** A stale half-written lease, a half log line, an uncommitted half batch, a half-written segment or an orphaned snapshot left by a crashed/displaced holder is reconciled on the next open: torn tails and uncommitted brackets are severed, an anchor-less snapshot from a displaced epoch is discarded, and reopening restores exactly the committed messages — none lost, none duplicated, with no visible hole or repeated sequence.
+- If the bus directory cannot be opened (it is a file, has been removed, or permissions are insufficient), `createBus` throws an `Error` synchronously.
 
 ## Log layout
 
 The log is a chain of segment files in the bus directory: the active `bus.jsonl` plus finalized `bus.<index>.jsonl` segments (index order is oldest first). `truncate` seals the active segment, then deletes whole finalized segments only. Before any segment file is unlinked, a checkpoint marker is written at the head of the fresh active segment carrying the cumulative stats, the consumer positions, the dedup table and the truncation horizon; the marker is the recovery anchor, so a crash anywhere inside `truncate` (a half-written segment or marker, deletes done but not synced) recovers with no lost or duplicated messages, positions and dedup come back exactly, and repeating the same truncation is harmless.
 
+Multi-writer coordination files in the same directory are `bus.lock` (the mutex), `bus.owner.json` (the lease: epoch and live sessions), `bus.epoch` (the durable epoch high-water mark) and one `bus.hb.<session>` heartbeat per open process. Snapshots taken with multiple writers possible are stored at generation/epoch-scoped names (`bus.snapshot.g<gen>.e<epoch>.json`), with `bus.snapshot.json` kept as a canonical mirror; all are valid snapshot inputs on recovery. None of these coordination files are part of the message log and all are managed automatically.
+
 ## Tests
 
     npm test
 
+The suite covers the single-process behaviour (unchanged) and cross-process scenarios driven through child processes: interleaved publishes/batches from two live writers, fencing of a displaced writer, shared dedup across processes and restarts, positions advanced from two processes, merged quota rejection, monotone merged stats, concurrent truncation/compaction, and recovery from stale leases, torn lines and orphaned snapshots.
+
 ## Limits
 
-One process owns a bus directory; no cross-process coordination.
 Records must be JSON-serialisable.
 No network transport and no broker integration.
