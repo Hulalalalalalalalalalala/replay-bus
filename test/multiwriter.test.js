@@ -544,7 +544,125 @@ test('multi-process: fsync on, concurrent truncation across processes stays cons
   await bus.close();
 });
 
-test('open throws Error synchronously when the directory is unusable', async () => {  const dir = await freshDir();
+test('read view: continuous cross-process writers page as one committed prefix while read lock-free', async () => {
+  const dir = await freshDir();
+  const a = new Worker(dir);
+  const b = new Worker(dir);
+  await a.call('stats');
+  await b.call('stats');
+
+  // A third, purely-reading instance in the parent process: it never writes
+  // and its readRange must keep serving while both workers commit.
+  const reader = createBus({ path: dir });
+  const PER = 60;
+  let nextA = 1;
+  let nextB = 1;
+  const writers = (async () => {
+    const jobs = [];
+    for (let i = 0; i < PER; i++) {
+      jobs.push(a.call('publishBatch', { records: [{ w: 'a', n: i }, { w: 'a', n: i + 0.5 }] }));
+      jobs.push(b.call('publish', { record: { w: 'b', n: i } }));
+      if (i % 13 === 0) jobs.push(b.call('compact'));
+      if (i % 17 === 0) jobs.push(a.call('truncate', { before: 0 })); // no-op roll boundary
+    }
+    await Promise.all(jobs);
+  })();
+  void nextA; void nextB;
+
+  const total = PER * 3; // 2 per A batch + 1 per B publish
+  let saw = 0;
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline) {
+    const page = reader.readRange(1, 32);
+    if (page.length > 0) {
+      // Every page is ascending; across repeated reads seqs never repeat or
+      // reorder (a committed prefix), and it ends on a real message.
+      for (let k = 1; k < page.length; k++) {
+        assert.ok(page[k].seq > page[k - 1].seq);
+      }
+      saw = Math.max(saw, page[page.length - 1].seq);
+    }
+    if (saw >= total) break;
+    await sleep(10);
+  }
+  await writers;
+
+  const all = reader.readRange(1, total);
+  assert.equal(all.length, total);
+  assert.deepEqual(all.map((m) => m.seq), Array.from({ length: total }, (_, i) => i + 1));
+  assert.equal(reader.stats().published, total);
+  await reader.close();
+
+  for (const p of [a, b]) await p.call('close');
+});
+
+test('read view: the same range reads identically across a cross-process compaction', async () => {
+  const dir = await freshDir();
+  const writer = new Worker(dir);
+  for (let i = 1; i <= 20; i++) await writer.call('publish', { record: { i } });
+
+  const reader = createBus({ path: dir });
+  const compactor = new Worker(dir);
+
+  // Baseline page taken by the independent reader.
+  const baseline = reader.readRange(1, 100).map((m) => m.seq);
+  assert.deepEqual(baseline, Array.from({ length: 20 }, (_, i) => i + 1));
+
+  // Another process compacts; the reader never takes the lock and the page
+  // is byte-for-byte the same across the snapshot switch.
+  await compactor.call('compact');
+  assert.deepEqual(reader.readRange(1, 100).map((m) => m.seq), baseline);
+
+  // Repeated compact/publish cycles: every observation is a continuous
+  // committed prefix, never a half snapshot.
+  for (let round = 0; round < 4; round++) {
+    for (let i = 0; i < 5; i++) {
+      await compactor.call('publish', { record: { round, i } });
+    }
+    await compactor.call('compact');
+    const page = reader.readRange(1, 1000);
+    for (let k = 1; k < page.length; k++) {
+      assert.equal(page[k].seq, page[k - 1].seq + 1);
+    }
+  }
+  const finalPage = reader.readRange(1, 1000);
+  assert.equal(finalPage[finalPage.length - 1].seq, 40);
+  assert.deepEqual(finalPage.map((m) => m.seq), Array.from({ length: 40 }, (_, i) => i + 1));
+
+  await writer.call('close');
+  await compactor.call('close');
+  await reader.close();
+});
+
+test('read view: a taken-over instance keeps reading (readRange/stats) while its queued group wholly fails', async () => {
+  const dir = await freshDir();
+  const env = { BUS_LEASE_MS: '400', BUS_RENEW_MS: '40' };
+  const a = new Worker(dir, env);
+  for (let i = 1; i <= 3; i++) await a.call('publish', { record: { w: 'a', n: i } });
+
+  a.stop();
+  await sleep(900);
+  const b = new Worker(dir, env);
+  assert.equal((await b.call('publish', { record: { w: 'b', n: 1 } })).seq, 4);
+
+  a.resume();
+  // Every queued write from the displaced holder fails wholesale...
+  await assert.rejects(a.call('publishBatch', { records: [{ w: 'a', n: 99 }] }), Error);
+  // ...yet its read-only path keeps working lock-free, seeing exactly the
+  // committed prefix with none of its rejected bytes mixed in.
+  const got = await a.call('readRange', { start: 1, limit: 100 });
+  assert.deepEqual(got.map((m) => m.seq), [1, 2, 3, 4]);
+  assert.deepEqual((await a.call('stats')).seq, 4);
+  assert.deepEqual((await a.call('readRange', { start: 2, limit: 2 })).map((m) => m.seq), [2, 3]);
+
+  // The new owner continues with a continuous sequence after the failed group.
+  assert.equal((await b.call('publish', { record: { w: 'b', n: 2 } })).seq, 5);
+  a.kill();
+  await b.call('close');
+});
+
+test('open throws Error synchronously when the directory is unusable', async () => {
+  const dir = await freshDir();
   // The path exists as a regular file: cannot become a bus directory.
   const file = path.join(dir, 'afile');
   writeFileSync(file, 'x');

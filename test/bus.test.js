@@ -370,6 +370,154 @@ test('register/advance/read reject synchronously after close; close is repeatabl
   assert.throws(() => bus.read('n'), Error);
 });
 
+// ---- readRange --------------------------------------------------------------
+
+test('readRange: inclusive of start, ascending, capped at limit, fewer at the tail', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir });
+  const records = [];
+  for (let i = 1; i <= 10; i++) {
+    records.push({ i, t: '你好' });
+    await bus.publish(records[i - 1]);
+  }
+  assert.deepEqual(bus.readRange(0, 3).map((m) => m.seq), [1, 2, 3]);
+  assert.deepEqual(bus.readRange(1, 3).map((m) => m.seq), [1, 2, 3]);
+  assert.deepEqual(bus.readRange(4, 2).map((m) => m.seq), [4, 5]);
+  // Fewer than limit at the tail.
+  assert.deepEqual(bus.readRange(9, 10).map((m) => m.seq), [9, 10]);
+  // Walking the whole log page by page reassembles it, ascending, no gaps.
+  const pages = [];
+  for (let start = 1; ; ) {
+    const page = bus.readRange(start, 3);
+    if (page.length === 0) break;
+    pages.push(...page);
+    start = page[page.length - 1].seq + 1;
+  }
+  assert.deepEqual(pages.map((m) => m.seq), records.map((_, i) => i + 1));
+  assert.deepEqual(pages.map((m) => m.record), records);
+  // Past the end.
+  assert.deepEqual(bus.readRange(11, 5), []);
+  await bus.close();
+});
+
+test('readRange: record shape matches replay/read', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir });
+  const ack = await bus.publish({ msg: '你好' });
+  const replayGot = await bus.replay(0);
+  assert.deepEqual(bus.readRange(1, 1), replayGot);
+  assert.deepEqual(bus.readRange(1, 1)[0], { seq: 1, id: ack.id, record: { msg: '你好' } });
+  await bus.close();
+});
+
+test('readRange: throws TypeError synchronously for bad start or limit', () => {
+  const dir = '/tmp/replay-bus-readrange-args';
+  const bus = createBus({ path: dir });
+  dirs.push(dir);
+  for (const bad of [-1, 1.5, NaN, '1', {}, null, true, undefined, 2n]) {
+    assert.throws(() => bus.readRange(bad, 1), TypeError);
+  }
+  for (const bad of [0, -1, 1.5, NaN, '2', {}, null, true, undefined, 2n]) {
+    assert.throws(() => bus.readRange(0, bad), TypeError);
+  }
+  return bus.close();
+});
+
+test('readRange: no side effects — stats, positions, replayed unchanged; repeat identical', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir });
+  for (let i = 1; i <= 5; i++) await bus.publish({ i });
+  bus.register('c');
+  bus.advance('c', 2);
+  const statsBefore = bus.stats();
+  const posBefore = bus.register('c');
+  const first = JSON.stringify(bus.readRange(1, 3));
+  for (let k = 0; k < 5; k++) {
+    assert.equal(JSON.stringify(bus.readRange(1, 3)), first);
+  }
+  assert.deepEqual(bus.stats(), statsBefore);
+  assert.equal(bus.stats().replayed, 0);
+  assert.equal(bus.register('c'), posBefore);
+  assert.deepEqual(bus.read('c').map((m) => m.seq), [3, 4, 5]);
+  await bus.close();
+});
+
+test('readRange: stays readable after close with the last view', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir });
+  for (let i = 1; i <= 4; i++) await bus.publish({ i });
+  await bus.close();
+  assert.deepEqual(bus.readRange(0, 10).map((m) => m.seq), [1, 2, 3, 4]);
+  assert.deepEqual(bus.readRange(3, 10).map((m) => m.seq), [3, 4]);
+  assert.deepEqual(bus.readRange(99, 10), []);
+});
+
+test('readRange: survives compaction unchanged; pages snapshot and live ranges', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir, fsync: true });
+  for (let i = 1; i <= 8; i++) await bus.publish({ i });
+  const before = bus.readRange(0, 100).map((m) => m.seq);
+  await bus.compact();
+  assert.deepEqual(bus.readRange(0, 100).map((m) => m.seq), before);
+  for (let i = 9; i <= 12; i++) await bus.publish({ i });
+  // Crosses the snapshot/live boundary inside one page.
+  assert.deepEqual(bus.readRange(6, 4).map((m) => m.seq), [6, 7, 8, 9]);
+  assert.deepEqual(bus.readRange(0, 100).map((m) => m.seq), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+  await bus.close();
+});
+
+test('readRange: start in a deleted range clamps to earliest survivor; wholly deleted is empty', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir });
+  for (let i = 1; i <= 10; i++) await bus.publish({ i });
+  // No consumers: first truncate rolls the straddled segment, second drops it.
+  await bus.truncate(5);
+  await bus.truncate(10);
+  assert.deepEqual(bus.readRange(0, 100), []);
+  for (let i = 11; i <= 13; i++) await bus.publish({ i });
+  // A start inside the deleted 1..10 gap begins at the earliest survivor.
+  assert.deepEqual(bus.readRange(1, 2).map((m) => m.seq), [11, 12]);
+  assert.deepEqual(bus.readRange(10, 1).map((m) => m.seq), [11]);
+  assert.deepEqual(bus.readRange(12, 10).map((m) => m.seq), [12, 13]);
+  // A wholly deleted single-seq window never throws and yields the survivor.
+  assert.equal(bus.readRange(5, 1).length, 1);
+  assert.equal(bus.readRange(5, 1)[0].seq, 11);
+  // Records and ids are intact.
+  assert.deepEqual(bus.readRange(11, 1)[0].record, { i: 11 });
+  await bus.close();
+});
+
+test('readRange: serves concurrently with continuous writers and always shows a committed prefix', async () => {
+  const dir = await freshDir();
+  const bus = createBus({ path: dir });
+  const N = 400;
+  // Background continuous writer.
+  const writes = (async () => {
+    for (let i = 1; i <= N; i++) {
+      await bus.publish({ i });
+    }
+  })();
+  // Read on every tick while writes commit; each page is ascending with no
+  // repeats, and the visible set is always a committed prefix.
+  let lastSeenMax = 0;
+  const tick = () => new Promise((resolve) => setImmediate(resolve));
+  while (lastSeenMax < N) {
+    await tick();
+    // Page forward from the last observed seq so progress always advances.
+    const page = bus.readRange(lastSeenMax + 1, 64);
+    if (page.length > 0) {
+      for (let k = 1; k < page.length; k++) assert.equal(page[k].seq, page[k - 1].seq + 1);
+      lastSeenMax = page[page.length - 1].seq;
+    }
+  }
+  await writes;
+  assert.deepEqual(
+    bus.readRange(1, N).map((m) => m.seq),
+    Array.from({ length: N }, (_, i) => i + 1),
+  );
+  await bus.close();
+});
+
 // ---- compact ---------------------------------------------------------------
 
 test('compact: replay of the same range before and after is identical', async () => {

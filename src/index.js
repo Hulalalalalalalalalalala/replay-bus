@@ -1129,6 +1129,11 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
       watermark: st.fenceEpoch,
     };
     syncScalars();
+    // A structural change this writer just observed/healed must replace the
+    // read view too: its cached message pages predate the reset. Defined
+    // later in the file (an arrow const), so guard for the acquisition-time
+    // prime that runs before it is initialized.
+    if (typeof adoptReadScan === 'function') adoptReadScan(st);
   };
 
   // Read a slice [off, end) of a regular file synchronously.
@@ -1233,6 +1238,196 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
     } else {
       adoptFullScan(scanDirectory(dir));
     }
+  };
+
+  // ---- lock-free read view ----------------------------------------------
+  // A read-only materialized view, refreshed WITHOUT the cross-process
+  // mutex and without walking the directory: ordinary appends are caught by
+  // the same incremental active-log tail reader the write path uses; a
+  // snapshot switch (compact/truncate), a fence, or a writer caught mid
+  // group escalates to one non-destructive scanDirectory (which never heals
+  // or unlinks), so readers always observe a committed prefix and never
+  // block behind a drain. Reads therefore stay off the write serial chain
+  // entirely: stats, usage, position lookups, read, readRange and the read
+  // half of replay all serve from here.
+  let readSt = null;
+  let readCursor = null;
+
+  const cloneMsg = (m) => ({ seq: m.seq, id: m.id, record: structuredClone(m.record) });
+
+  // Adopt a scan as the read view WITHOUT aliasing the write view: the
+  // drain mutates its own `view` in place after every commit, so sharing the
+  // object would let a write advance the read counters and then let the
+  // incremental tail reader apply the same bytes again. Structural scans
+  // (compact/truncate) are rare, so copying the message arrays here is
+  // cheap; ordinary appends never go through this.
+  const adoptReadScan = (st) => {
+    readSt = {
+      seq: st.seq,
+      bytes: st.bytes,
+      published: st.published,
+      replayed: st.replayed,
+      horizon: st.horizon,
+      usageBytes: st.usageBytes,
+      dedup: new Map(st.dedup),
+      positions: new Map(st.positions),
+      snapshotGen: st.snapshotGen,
+      foldedSeq: st.foldedSeq,
+      fenceEpoch: st.fenceEpoch,
+      baseMessages: st.baseMessages.map(cloneMsg),
+      live: st.live.map(cloneMsg),
+    };
+    // A read-only scan does not heal the open-bracket/torn tail it found:
+    // the cursor must stop at the durable prefix (the tail's planned
+    // length), not at EOF, so the incremental reader re-reads the group
+    // once its commit line lands instead of skipping past its messages.
+    let off = st.activeId.size;
+    for (const tail of st.tails) {
+      if (tail.path === logPath && tail.length < off) off = tail.length;
+    }
+    readCursor = {
+      dev: st.activeId.dev,
+      ino: st.activeId.ino,
+      head: st.activeId.head,
+      off,
+      watermark: st.fenceEpoch,
+    };
+  };
+
+  // Fold committed tail units into the read view. Unlike the write hot
+  // cache, the read view also retains message payloads (in `live`) so a
+  // paged read needs no directory walk at all.
+  const applyReadUnits = (units) => {
+    for (const entry of units) {
+      if (entry.t === 'm') {
+        if (entry.seq <= readSt.horizon) continue;
+        readSt.seq = entry.seq;
+        readSt.bytes += entry.bytes;
+        readSt.usageBytes += entry.bytes;
+        readSt.published += 1;
+        if (typeof entry.d === 'string') {
+          readSt.dedup.set(entry.d, { id: entry.id, seq: entry.seq });
+        }
+        readSt.live.push({ seq: entry.seq, id: entry.id, record: entry.record });
+      } else if (entry.t === 's') {
+        readSt.replayed += entry.n;
+      } else if (entry.t === 'p') {
+        readSt.positions.set(entry.name, entry.pos);
+      }
+    }
+  };
+
+  const refreshReadView = () => {
+    const publish = () => {
+      if (readSt) {
+        seq = readSt.seq;
+        bytes = readSt.bytes;
+        published = readSt.published;
+        replayed = readSt.replayed;
+        usageBytes = readSt.usageBytes;
+      }
+    };
+    // First time, or after an invalidation: one lock-free full scan.
+    if (!readSt || !readCursor) {
+      try {
+        adoptReadScan(scanDirectory(dir));
+      } catch {
+        // A writer reshaping the directory mid-scan: keep the empty view;
+        // the next read retries.
+        if (!readSt) {
+          adoptReadScan({
+            seq: 0, bytes: 0, published: 0, replayed: 0, horizon: 0,
+            usageBytes: 0, dedup: new Map(), positions: new Map(),
+            snapshotGen: 0, foldedSeq: 0, fenceEpoch: 0,
+            baseMessages: [], live: [], tails: [],
+            activeId: { dev: 0, ino: 0, size: 0, head: null },
+          });
+        }
+      }
+      publish();
+      return;
+    }
+    let info;
+    try {
+      info = statSync(logPath);
+    } catch {
+      // Active log momentarily absent (a rename in flight): the last
+      // materialized view is still a valid committed prefix.
+      return;
+    }
+    if (
+      readCursor.dev === info.dev &&
+      readCursor.ino === info.ino &&
+      info.size >= readCursor.off
+    ) {
+      const headNow = info.size > 0 ? readHeadSync(logPath) : '';
+      if (headNow === readCursor.head) {
+        if (info.size === readCursor.off) return;
+        let parsed = null;
+        try {
+          const raw = readTail(logPath, readCursor.off, info.size - readCursor.off);
+          parsed = committedUnits(raw, readCursor.watermark);
+        } catch {
+          // A racing rename/unlink: leave the view for the next refresh.
+          return;
+        }
+        if (parsed.closed && !parsed.structural && !parsed.torn) {
+          applyReadUnits(parsed.units);
+          readCursor.off = info.size;
+          readCursor.watermark = parsed.watermark;
+          publish();
+          return;
+        }
+        // Open bracket (writer mid group), torn tail or a marker/fence:
+        // fall through to a lock-free authoritative scan. It never heals,
+        // and parks the cursor at the durable prefix, so the committing
+        // group is picked up whole by the next incremental read.
+      }
+    }
+    try {
+      adoptReadScan(scanDirectory(dir));
+    } catch {
+      // Directory reshaped while the scan read it (rename/unlink race):
+      // serve the previous materialized view — an immutable committed
+      // prefix — and retry on the next call.
+    }
+    publish();
+  };
+
+  // Binary search: first index whose seq is strictly greater than floor.
+  const firstSeqAbove = (arr, floor) => {
+    let lo = 0;
+    let hi = arr.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (arr[mid].seq > floor) hi = mid;
+      else lo = mid + 1;
+    }
+    return lo;
+  };
+
+  // Inclusive-of-start ascending page, at most `limit` entries (limit may
+  // be Infinity). Snapshot survivors first, then the live suffix; both
+  // arrays are entered by binary search so a page near the tail costs
+  // O(log n + limit), never O(n).
+  const readViewPage = (start, limit) => {
+    if (!readSt) return [];
+    const floor = Math.max(start - 1, readSt.horizon);
+    const out = [];
+    let i = firstSeqAbove(readSt.baseMessages, floor);
+    for (; i < readSt.baseMessages.length && out.length < limit; i++) {
+      const m = readSt.baseMessages[i];
+      out.push({ seq: m.seq, id: m.id, record: structuredClone(m.record) });
+    }
+    if (out.length < limit) {
+      const logFloor = Math.max(floor, readSt.foldedSeq);
+      let j = firstSeqAbove(readSt.live, logFloor);
+      for (; j < readSt.live.length && out.length < limit; j++) {
+        const m = readSt.live[j];
+        out.push({ seq: m.seq, id: m.id, record: structuredClone(m.record) });
+      }
+    }
+    return out;
   };
 
   // Stage one publish/publishBatch request into the lock-free queue. The
@@ -1469,18 +1664,51 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
     }
 
     // Gather staged requests oldest first; mtime is the cross-process
-    // enqueue order, the token is a deterministic tie-breaker.
+    // enqueue order, the token is a deterministic tie-breaker. The gather
+    // is a bounded grace window, not a single snapshot: requests other
+    // writers stage WHILE this drain already holds the mutex (including
+    // ones arriving during the entrance wait above) are re-collected until
+    // the directory is briefly quiet, so real concurrent writers merge into
+    // this one commit group. The wait is paid only while another live
+    // session shares the lease (a sole writer needs no grace and keeps the
+    // uncontended fast path), stays bounded, and keeps the heartbeat fresh.
+    const gatherMs = seamNumber('BUS_DRAIN_GATHER_MS') || 25;
+    const settleMs = Math.min(5, gatherMs);
+    const otherLive = lease.sessions.some((s) => s.id !== sessionId && heartbeatAlive(s.id));
     const files = [];
-    for (const name of readdirSync(dir)) {
-      const m = QUEUE_RE.exec(name);
-      if (!m) continue;
-      let mt = 0;
-      try {
-        mt = statSync(path.join(dir, name)).mtimeMs;
-      } catch {
-        mt = 0;
+    const seen = new Set();
+    const scanOnce = () => {
+      let added = 0;
+      for (const name of readdirSync(dir)) {
+        const m = QUEUE_RE.exec(name);
+        if (!m || seen.has(m[1])) continue;
+        seen.add(m[1]);
+        let mt = 0;
+        try {
+          mt = statSync(path.join(dir, name)).mtimeMs;
+        } catch {
+          mt = 0;
+        }
+        files.push({ name, token: m[1], mt });
+        added += 1;
       }
-      files.push({ name, token: m[1], mt });
+      return added;
+    };
+    scanOnce();
+    if (otherLive) {
+      // While arrivals keep coming, extend the window (bounded); stop after
+      // one quiet tick so an uncontended drain waits at most one tick.
+      const gatherStart = Date.now();
+      let quietTicks = 0;
+      for (;;) {
+        writeHeartbeat();
+        sleepSync(settleMs);
+        const added = scanOnce();
+        const elapsed = Date.now() - gatherStart;
+        if (added > 0) quietTicks = 0;
+        else quietTicks += 1;
+        if (elapsed >= gatherMs || quietTicks >= 1) break;
+      }
     }
     files.sort((a, b) => (a.mt !== b.mt ? a.mt - b.mt : a.token < b.token ? -1 : 1));
 
@@ -1941,21 +2169,43 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
       return fn(lease, view);
     }, waitMs);
 
-  // Bring the incremental cursor forward after a direct append the drain
+  // Bring the incremental cursors forward after a direct append the drain
   // did not perform (a replay/position line). A structural replacement
   // cannot happen while this instance holds the lock, so the inode is the
-  // same; anything unexpected invalidates the cursor and forces a rescan.
+  // same; anything unexpected invalidates a cursor and forces a rescan.
+  // The read cursor is advanced only when it was already exactly byteCount
+  // behind EOF (these callers refresh it first); otherwise it is dropped and
+  // the next read rebuilds it, never double-counting the marker line.
   const noteAppended = (byteCount) => {
-    if (!cursor) return;
-    try {
-      const info = statSync(logPath);
-      if (info.dev === cursor.dev && info.ino === cursor.ino && info.size >= cursor.off) {
-        cursor.off = Math.max(cursor.off + byteCount, info.size);
-      } else {
+    if (cursor) {
+      try {
+        const info = statSync(logPath);
+        if (info.dev === cursor.dev && info.ino === cursor.ino && info.size >= cursor.off) {
+          cursor.off = Math.max(cursor.off + byteCount, info.size);
+        } else {
+          cursor = null;
+        }
+      } catch {
         cursor = null;
       }
-    } catch {
-      cursor = null;
+    }
+    if (readCursor) {
+      try {
+        const info = statSync(logPath);
+        const headNow = info.size > 0 ? readHeadSync(logPath) : '';
+        if (
+          info.dev === readCursor.dev &&
+          info.ino === readCursor.ino &&
+          headNow === readCursor.head &&
+          info.size === readCursor.off + byteCount
+        ) {
+          readCursor.off = info.size;
+        } else {
+          readCursor = null;
+        }
+      } catch {
+        readCursor = null;
+      }
     }
   };
 
@@ -2130,23 +2380,52 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
   const isLockError = (err) =>
     err && typeof err.message === 'string' && err.message.startsWith('bus lock');
 
-  // Position writes are synchronous (register/advance/read are synchronous
-  // methods). Under multi-writer they still take the lock and validate the
-  // credential, and the merged position map comes from the shared files.
-  const persistPosition = (name, pos) => {
+  // Persist (or confirm) a consumer position while holding the write lock.
+  // The lock-free read view supplies the fast-path lookup, but the
+  // authoritative no-reset / no-backward decision is made HERE under the
+  // mutex against the freshly caught-up merged view, so two processes can
+  // never reset or move a position backwards together.
+  //   kind 'register': an existing position is returned untouched; only a
+  //                    brand-new name is persisted at 0.
+  //   kind 'advance' : a backwards move throws RangeError; an equal value
+  //                    is a write-free no-op; a higher value is persisted.
+  // Returns the resulting position.
+  const positionLocked = (name, pos, kind) => {
+    let resulting = pos;
     try {
       withOwnership(() => {
+        const current = view.positions.get(name);
+        if (current !== undefined) {
+          if (kind === 'advance') {
+            if (pos < current) {
+              throw new RangeError('advance: position cannot move backwards');
+            }
+            if (pos === current) {
+              // Setting the current value is a write-free no-op success.
+              resulting = current;
+              return;
+            }
+            // A strictly higher value falls through and is persisted.
+          } else {
+            // register of an existing name never resets it.
+            resulting = current;
+            return;
+          }
+        }
         const line = JSON.stringify({ t: 'p', name, pos, g: epoch }) + '\n';
         appendTo(logPath, Buffer.from(line, 'utf8'), fsync);
-        // Reflect locally on the cached view without a full rescan.
+        // Reflect locally on the cached views without a full rescan.
         view.positions.set(name, pos);
         syncScalars();
+        if (readSt) readSt.positions.set(name, pos);
         noteAppended(Buffer.byteLength(line, 'utf8'));
+        resulting = pos;
       });
     } catch (err) {
       if (!fenced && !isLockError(err)) broken = true;
       throw err;
     }
+    return resulting;
   };
 
   const assertOpen = () => {
@@ -2175,15 +2454,15 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
   const renewTimer = setInterval(renew, RENEW_MS);
   renewTimer.unref?.();
 
+  // Refresh the lock-free read view (no mutex, no directory walk on the
+  // append-only fast path). Every stats/usage/position/read call refreshes:
+  // an unchanged log costs one stat, appends cost only the new tail bytes,
+  // and a snapshot switch (compact/truncate) costs one non-destructive scan.
+  // The view is always an immutable committed prefix, never a half group.
+  // After close the last materialized view stands and is simply returned.
   const bestEffortView = () => {
-    try {
-      withLockSync(() => {
-        // Read-only adoption of the merged view; never heal here.
-        catchupLocked({ mutating: false });
-      }, VIEW_WAIT_MS);
-    } catch {
-      // Lock held by a writer right now: the cached view stays valid.
-    }
+    if (closed) return;
+    refreshReadView();
   };
 
   const bus = {
@@ -2390,16 +2669,14 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
           throw new Error('bus is closed');
         }
         return withOwnership(() => {
-          // Message payloads are not kept in the write hot-cache, so a read
-          // takes a fresh non-destructive directory scan (the same scan the
-          // baseline paid; the write drain never does).
-          const full = scanDirectory(dir);
-          adoptFullScan(full);
-          // replay(from) is inclusive of from; messagesAfter takes an
-          // exclusive lower bound. Replay does not drain staged publish
-          // requests: lock acquisition order is the total order, so a
+          // The returned page comes from the lock-free read view; refresh it
+          // once (the write mutex is already held here, and this refresh
+          // takes none) so the marker reflects exactly what was returned.
+          // replay(from) is inclusive of from; the page takes an exclusive
+          // lower bound. Replay does not drain staged publish requests: a
           // request still only staged lands after this marker.
-          const out = messagesAfter(view, from - 1);
+          refreshReadView();
+          const out = messagesAfter(readSt, from - 1);
           const n = out.length;
           if (n > 0) {
             const line = JSON.stringify({ t: 's', n, g: epoch }) + '\n';
@@ -2412,6 +2689,7 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
             reassertLocked();
             view.replayed += n;
             syncScalars();
+            if (readSt) readSt.replayed = view.replayed;
             noteAppended(Buffer.byteLength(line, 'utf8'));
           }
           return out;
@@ -2422,25 +2700,17 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
     register(name) {
       if (closed || broken) throw new Error('bus is closed');
       assertName(name);
-      // The authoritative position table is the shared one. Read-only
-      // lookup: no healing, no credential check (works even after a
-      // takeover); only registering a brand-new name writes and is fenced.
-      let current;
-      try {
-        current = withOwnership(() => view.positions.get(name), { readonly: true });
-      } catch (err) {
-        if (!fenced && !isLockError(err)) broken = true;
-        throw err;
-      }
-      // Re-registering an existing name must not reset its position.
-      if (current !== undefined) {
-        return current;
-      }
+      // The lookup is lock-free; the authoritative no-reset decision is
+      // made inside the write lock, so it works even while writers are
+      // draining or after a takeover (a fenced instance only fails when it
+      // actually has to register a brand-new name).
+      refreshReadView();
+      const seen = readSt ? readSt.positions.get(name) : undefined;
+      if (seen !== undefined) return seen;
       if (fenced) {
         throw new Error('bus write ownership was taken over by another process');
       }
-      persistPosition(name, 0);
-      return 0;
+      return positionLocked(name, 0, 'register');
     },
 
     advance(name, to) {
@@ -2449,26 +2719,16 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
       if (typeof to !== 'number' || !Number.isInteger(to) || to < 0) {
         throw new RangeError('advance: position must be a non-negative integer');
       }
-      // Read the merged current value under the lock so two processes
-      // advancing the same consumer obey the no-backwards rule together.
-      let current;
-      try {
-        current = withOwnership(() => view.positions.get(name), { readonly: true });
-      } catch (err) {
-        if (!fenced && !isLockError(err)) broken = true;
-        throw err;
-      }
-      if (current !== undefined) {
-        if (to < current) {
-          throw new RangeError('advance: position cannot move backwards');
-        }
-        if (to === current) {
-          return current;
-        }
+      // Fast path from the lock-free view; the no-backwards rule is
+      // re-adjudicated under the write lock against the merged position, so
+      // two processes advancing one consumer obey it together.
+      refreshReadView();
+      const seen = readSt ? readSt.positions.get(name) : undefined;
+      if (seen !== undefined && to < seen) {
+        throw new RangeError('advance: position cannot move backwards');
       }
       // An unknown name is auto-registered, same as register() first.
-      persistPosition(name, to);
-      return to;
+      return positionLocked(name, to, 'advance');
     },
 
     read(name) {
@@ -2476,28 +2736,33 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
         throw new Error('bus is closed');
       }
       assertName(name);
-      // Read-only: even a fenced instance may read, but an unknown name is
-      // auto-registered (a write), which a fenced instance may not do.
-      // Message payloads live on disk, not the write hot-cache, so a read
-      // takes its own non-destructive scan.
-      let pos;
-      let readView;
-      try {
-        withOwnership(() => {
-          readView = scanDirectory(dir);
-          pos = readView.positions.get(name);
-        }, { readonly: true });
-      } catch (err) {
-        if (!fenced && !isLockError(err)) broken = true;
-        throw err;
-      }
+      // Entirely lock-free: even a fenced instance or one parked behind a
+      // long drain reads. An unknown name is auto-registered (a write),
+      // which a fenced instance may not do; the authoritative position
+      // comes back from the write lock.
+      refreshReadView();
+      let pos = readSt ? readSt.positions.get(name) : undefined;
       if (pos === undefined) {
-        // Persists a position line, so it validates the credential.
-        persistPosition(name, 0);
-        pos = 0;
+        pos = positionLocked(name, 0, 'register');
       }
       // read never moves the position; advance() is how consumption lands.
-      return messagesAfter(readView, pos);
+      return messagesAfter(readSt, pos);
+    },
+
+    // Synchronous, lock-free paged read. Inclusive of start, ascending, at
+    // most `limit` records (fewer at the tail). A start inside a truncated
+    // gap begins at the earliest surviving message; a wholly deleted range
+    // returns []. It changes no seq, position or stat, is readable after
+    // close like stats()/usage(), and is side-effect free on repeat calls.
+    readRange(start, limit) {
+      if (typeof start !== 'number' || !Number.isInteger(start) || start < 0) {
+        throw new TypeError('readRange: start must be a non-negative integer');
+      }
+      if (typeof limit !== 'number' || !Number.isInteger(limit) || limit <= 0) {
+        throw new TypeError('readRange: limit must be a positive integer');
+      }
+      if (!closed) refreshReadView();
+      return readViewPage(start, limit);
     },
 
     compact() {
@@ -2853,6 +3118,16 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
         } catch {
           // Closing never rejects: the lease heartbeat expiry reclaims the
           // session even if the lock cannot be taken right now.
+        }
+        // Freeze the read view at everything committed so far: readRange,
+        // stats() and usage() keep serving this last materialized prefix
+        // after close. Lock-free (the lock may just have been released),
+        // and best-effort — a failed refresh leaves the previous committed
+        // view, which is still valid.
+        try {
+          refreshReadView();
+        } catch {
+          // Last view stands.
         }
       });
     },
