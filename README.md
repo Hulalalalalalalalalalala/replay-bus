@@ -1,6 +1,6 @@
 # replay-bus
 
-Append-only message bus for one process: every publish is durable before it is acknowledged, and a replay from a sequence number never repeats a message twice.
+Append-only message bus: every publish is durable before it is acknowledged, and a replay from a sequence number never repeats a message twice. Multiple processes may hold the same bus directory open and write to it; a takeover lease keeps the shared log consistent.
 
 ## Requirements
 
@@ -32,9 +32,17 @@ Node.js 20 or newer. No runtime dependencies.
 
 Unknown consumer names are auto-registered by `advance`/`read` exactly as if `register` had been called first. Positions, the dedup table and stats survive restarts; a crash anywhere inside `compact` (half-written snapshot, torn log tail) or inside a batch (a half-written group bracket) recovers to a consistent state with no lost or duplicated messages. The post-compaction log is replaced via a synced temp file plus an atomic rename (rather than truncating an open append handle), so compaction also works on Windows; a failed directory sync along the way only weakens the durability guarantee, it never fails the compaction or blocks the bus.
 
+## Multiple writers
+
+Any number of processes may open the same bus directory. Opening takes over the write lease (`bus.lease.json`, atomically replaced via `bus.lease.tmp`): the lease carries a credential — an epoch that increments with every takeover plus a unique owner token — and every append, batch, truncate and compact validates that credential against the lease on disk before touching the log. A process whose ownership was taken over keeps reading normally, but its publishes, batches, truncations and compactions reject with `Error` and leave the log untouched; to write again it must reopen the bus. A half-written lease left by a crashed predecessor is treated as no lease and simply taken over.
+
+Dedup keys, consumer positions, retained-byte usage and the four cumulative stats are one shared state across every writer: a resent `dedupKey` counts once and reuses the first acknowledgement no matter which process sends it, the `maxBytes` quota is judged on the merged occupancy (an over-quota message or group is rejected whole, state untouched), truncation holds segments back for consumers registered through any process, and `stats()` never shrinks across writers, takeovers or restarts. A predecessor that crashed mid-write (half lease, torn log line, half-written segment file) is recovered on open with no lost or duplicated messages and no visible sequence gaps or duplicates.
+
 ## Log layout
 
-The log is a chain of segment files in the bus directory: the active `bus.jsonl` plus finalized `bus.<index>.jsonl` segments (index order is oldest first). `truncate` seals the active segment, then deletes whole finalized segments only. Before any segment file is unlinked, a checkpoint marker is written at the head of the fresh active segment carrying the cumulative stats, the consumer positions, the dedup table and the truncation horizon; the marker is the recovery anchor, so a crash anywhere inside `truncate` (a half-written segment or marker, deletes done but not synced) recovers with no lost or duplicated messages, positions and dedup come back exactly, and repeating the same truncation is harmless.
+The log is a chain of segment files in the bus directory: the active `bus.jsonl` plus finalized `bus.<index>.jsonl` segments (index order is oldest first). `truncate` seals the active segment, then deletes whole finalized segments only. Before any segment file is unlinked, a checkpoint marker is written at the head of the fresh active segment carrying the cumulative stats, the consumer positions, the dedup table and the truncation horizon; the marker is the recovery anchor, so a crash anywhere inside `truncate` (a half-written segment or marker, deletes done but not synced) recovers with no lost or duplicated messages, positions and dedup come back exactly, and repeating the same truncation is harmless. Segment deletion is unconditional once the checkpoint is durable; directory syncs around it are best-effort and their failure never strands a segment.
+
+Write ownership lives in `bus.lease.json` (atomically replaced via `bus.lease.tmp`): the lease epoch increments with every takeover and is validated before each append, batch, truncate and compact.
 
 ## Tests
 
@@ -42,6 +50,6 @@ The log is a chain of segment files in the bus directory: the active `bus.jsonl`
 
 ## Limits
 
-One process owns a bus directory; no cross-process coordination.
+Write ownership is whole-directory: exactly one lease holder at a time, and a taken-over holder must reopen to write again.
 Records must be JSON-serialisable.
 No network transport and no broker integration.

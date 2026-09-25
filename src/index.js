@@ -20,6 +20,12 @@ const LOG_NAME = 'bus.jsonl';
 const LOG_TMP_NAME = 'bus.log.tmp';
 const SNAPSHOT_NAME = 'bus.snapshot.json';
 const SNAPSHOT_TMP_NAME = 'bus.snapshot.tmp';
+// Write-ownership lease: opening the bus takes the lease over (bumping the
+// epoch) and every append/batch/truncate/compact re-validates it before
+// touching disk, so a previous holder that lost the takeover fails
+// wholesale instead of mixing content into the shared log.
+const LEASE_NAME = 'bus.lease.json';
+const LEASE_TMP_NAME = 'bus.lease.tmp';
 // The log is a chain of segment files: the active `bus.jsonl` plus finalized
 // `bus.<index>.jsonl` segments. Index order is oldest first; an index is
 // never reused within the lifetime of a directory.
@@ -98,6 +104,8 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
   const logTmpPath = path.join(dir, LOG_TMP_NAME);
   const snapshotPath = path.join(dir, SNAPSHOT_NAME);
   const snapshotTmpPath = path.join(dir, SNAPSHOT_TMP_NAME);
+  const leasePath = path.join(dir, LEASE_NAME);
+  const leaseTmpPath = path.join(dir, LEASE_TMP_NAME);
 
   let seq = 0; // seq of the last effective message
   let bytes = 0;
@@ -121,38 +129,49 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
   let horizon = 0;
   // Every message with seq <= foldedSeq lives in the snapshot, not the log.
   let foldedSeq = 0;
-  // Index handed to the next finalized segment; never reused within a run.
-  let nextSegmentIndex = 1;
+  // Index handed to the next finalized segment; never decreases within a
+  // run, so an index is never reused while this instance lives.
+  let segmentHighWater = 1;
   // Business bytes of the messages still retained (seq > horizon, i.e.
   // snapshot survivors plus live-log messages). Unlike the cumulative
   // `bytes` stat this shrinks when retention truncation frees messages;
   // compaction only reshapes the log and never changes it.
   let usageBytes = 0;
 
-  // ---- synchronous recovery so stats() is correct the moment createBus returns
-  mkdirSync(dir, { recursive: true });
+  // Finalized segments present in the directory, oldest first.
+  const listSegments = () => {
+    const out = [];
+    for (const name of readdirSync(dir)) {
+      const match = SEGMENT_RE.exec(name);
+      if (match) out.push({ index: Number(match[1]), path: path.join(dir, name) });
+    }
+    out.sort((a, b) => a.index - b.index);
+    return out;
+  };
 
-  // A leftover tmp file is a snapshot that crashed mid-write. The pre-compact
-  // log is still intact, so the half snapshot carries no state: drop it.
-  rmSync(snapshotTmpPath, { force: true });
-  // Likewise a log tmp left behind when compact crashed before the rename:
-  // the live log (if any) is still the source of truth.
-  rmSync(logTmpPath, { force: true });
+  // First complete line of a log file, or null when there is none.
+  const firstEntry = (filePath) => {
+    const raw = readFileSync(filePath);
+    const nl = raw.indexOf(0x0a);
+    if (nl <= 0) return null;
+    try {
+      return JSON.parse(raw.toString('utf8', 0, nl));
+    } catch {
+      return null;
+    }
+  };
 
-  if (existsSync(snapshotPath)) {
-    const snap = JSON.parse(readFileSync(snapshotPath, 'utf8'));
-    snapshotGen = snap.gen;
-    seq = snap.seq;
-    bytes = snap.bytes;
-    published = snap.published;
-    replayed = snap.replayed;
-    // Snapshots written before truncation existed carry no horizon.
-    horizon = snap.horizon ?? 0;
-    foldedSeq = snap.seq;
-    for (const [key, value] of snap.dedup) dedup.set(key, value);
-    for (const [name, pos] of Object.entries(snap.positions)) positions.set(name, pos);
-    baseMessages = snap.messages;
-  }
+  // Highest message seq in a segment file; null when it carries no messages.
+  const segmentMaxSeq = (filePath) => {
+    const { entries } = parseLog(readFileSync(filePath));
+    let max = null;
+    for (const entry of entries) {
+      if (entry.t === 'm' && (max === null || entry.seq > max)) max = entry.seq;
+    }
+    return max;
+  };
+
+  const markerLine = (gen) => JSON.stringify({ t: 'c', gen }) + '\n';
 
   const applyEntry = (entry) => {
     if (entry.t === 'm') {
@@ -188,15 +207,14 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
     for (const [key, value] of entry.dedup) dedup.set(key, value);
   };
 
-  const markerLine = (gen) => JSON.stringify({ t: 'c', gen }) + '\n';
-
-  // Replay complete log lines and apply only the committed prefix.
-  // A batch is bracketed by {t:'b',id} .. entries .. {t:'bk',id}: a begin
-  // without its matching commit (crash mid-write, or overtaken by a newer
-  // begin) is severed wholesale and none of its entries take effect.
-  // Returns the byte offset just past the last committed line, so both a
-  // torn trailing write and an uncommitted batch tail can be truncated.
-  const recoverLog = (raw) => {
+  // Replay complete log lines, handing only the committed prefix to
+  // `sink(entry, grouped)` in application order. A batch is bracketed by
+  // {t:'b',id} .. entries .. {t:'bk',id}: a begin without its matching
+  // commit (crash mid-write, or overtaken by a newer begin) is severed
+  // wholesale and none of its entries reach the sink. Returns the byte
+  // offset just past the last committed line, so both a torn trailing
+  // write and an uncommitted batch tail can be truncated.
+  const recoverLog = (raw, sink) => {
     let lineStart = 0;
     let committedEnd = 0;
     let group = null;
@@ -205,7 +223,7 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
       const entry = i > lineStart ? JSON.parse(raw.toString('utf8', lineStart, i)) : null;
       if (group !== null) {
         if (entry && entry.t === 'bk' && entry.id === group.id) {
-          for (const e of group.entries) applyEntry(e);
+          for (const e of group.entries) sink(e, true);
           group = null;
           committedEnd = i + 1;
         } else if (entry && entry.t === 'b') {
@@ -217,10 +235,7 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
       } else if (entry && entry.t === 'b') {
         group = { id: entry.id, entries: [] };
       } else {
-        if (entry) {
-          if (entry.t === 't') applyMarker(entry);
-          else applyEntry(entry);
-        }
+        if (entry) sink(entry, false);
         committedEnd = i + 1;
       }
       lineStart = i + 1;
@@ -228,105 +243,194 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
     return committedEnd;
   };
 
-  // Finalized segments present in the directory, oldest first.
-  const listSegments = () => {
-    const out = [];
-    for (const name of readdirSync(dir)) {
-      const match = SEGMENT_RE.exec(name);
-      if (match) out.push({ index: Number(match[1]), path: path.join(dir, name) });
-    }
-    out.sort((a, b) => a.index - b.index);
-    return out;
+  // One committed entry during state recovery: top-level truncate markers
+  // are absolute checkpoints; everything else (including batch-bracketed
+  // entries, surfaced only once their commit lands) folds in singly.
+  const applyRecovered = (entry, grouped) => {
+    if (!grouped && entry.t === 't') applyMarker(entry);
+    else applyEntry(entry);
   };
 
-  // First complete line of a log file, or null when there is none.
-  const firstEntry = (filePath) => {
-    const raw = readFileSync(filePath);
-    const nl = raw.indexOf(0x0a);
-    if (nl <= 0) return null;
-    try {
-      return JSON.parse(raw.toString('utf8', 0, nl));
-    } catch {
-      return null;
-    }
-  };
+  // Rebuild every piece of shared state from what is durable in the
+  // directory. With `repair` the directory is also reconciled: crash
+  // leftovers (half-written snapshot/log tmp files, a torn trailing line,
+  // an uncommitted batch bracket, segments already folded or truncated)
+  // are cleaned up so the next append starts from an unambiguous log.
+  // This runs at open and again before every operation, because other
+  // writers may have advanced the shared state — dedup keys, consumer
+  // positions, retained usage and the cumulative counters are one state
+  // across every process holding this directory open.
+  const recover = (repair) => {
+    seq = 0;
+    bytes = 0;
+    published = 0;
+    replayed = 0;
+    dedup.clear();
+    positions.clear();
+    snapshotGen = 0;
+    baseMessages = [];
+    horizon = 0;
+    foldedSeq = 0;
+    usageBytes = 0;
 
-  // Highest message seq in a segment file; null when it carries no messages.
-  const segmentMaxSeq = (filePath) => {
-    const { entries } = parseLog(readFileSync(filePath));
-    let max = null;
-    for (const entry of entries) {
-      if (entry.t === 'm' && (max === null || entry.seq > max)) max = entry.seq;
+    if (repair) {
+      // A leftover tmp file is a snapshot that crashed mid-write. The
+      // pre-compact log is still intact, so the half snapshot carries no
+      // state: drop it. Likewise a log tmp left behind when compact
+      // crashed before the rename: the live log (if any) is still the
+      // source of truth.
+      rmSync(snapshotTmpPath, { force: true });
+      rmSync(logTmpPath, { force: true });
     }
-    return max;
-  };
 
-  const segments = listSegments();
-  for (const seg of segments) {
-    if (seg.index >= nextSegmentIndex) nextSegmentIndex = seg.index + 1;
-  }
-  // The ordered log is every finalized segment (oldest first) followed by
-  // the active log file.
-  const ordered = segments.map((seg) => seg.path);
-  if (existsSync(logPath)) ordered.push(logPath);
-
-  // The newest anchor — a segment whose first line is a compact ('c') or
-  // truncate ('t') marker for the current snapshot generation — starts the
-  // live suffix of the log. Everything before it is folded into the snapshot
-  // or checkpointed into that marker.
-  let startAt = -1;
-  for (let i = 0; i < ordered.length; i++) {
-    const first = firstEntry(ordered[i]);
-    if (first && (first.t === 'c' || first.t === 't') && first.gen === snapshotGen) {
-      startAt = i;
+    if (existsSync(snapshotPath)) {
+      const snap = JSON.parse(readFileSync(snapshotPath, 'utf8'));
+      snapshotGen = snap.gen;
+      seq = snap.seq;
+      bytes = snap.bytes;
+      published = snap.published;
+      replayed = snap.replayed;
+      // Snapshots written before truncation existed carry no horizon.
+      horizon = snap.horizon ?? 0;
+      foldedSeq = snap.seq;
+      for (const [key, value] of snap.dedup) dedup.set(key, value);
+      for (const [name, pos] of Object.entries(snap.positions)) positions.set(name, pos);
+      baseMessages = snap.messages;
     }
-  }
 
-  if (snapshotGen > 0 && startAt < 0) {
-    // Crash between the snapshot rename and the log reset: every byte still
-    // on disk is already folded into the snapshot. Reset to a marker-led log
-    // so the state is unambiguous from here on.
-    for (const seg of segments) rmSync(seg.path, { force: true });
-    writeFileSync(logPath, markerLine(snapshotGen));
-  } else {
-    // Replay the live suffix; a torn tail or uncommitted batch is severed.
-    for (let i = Math.max(startAt, 0); i < ordered.length; i++) {
-      const raw = readFileSync(ordered[i]);
-      const committedEnd = recoverLog(raw);
-      if (committedEnd < raw.length) truncateSync(ordered[i], committedEnd);
+    const segments = listSegments();
+    let highest = 1;
+    for (const seg of segments) {
+      if (seg.index >= highest) highest = seg.index + 1;
     }
-    // Reconcile leftovers of an interrupted truncate/compact: finalized
-    // segments before the anchor whose content is folded into the snapshot
-    // or at/below the truncation horizon can go. Segments a consumer still
-    // needs (above the horizon) stay untouched.
-    for (let i = 0; i < startAt; i++) {
-      const max = segmentMaxSeq(ordered[i]);
-      if (max === null || max <= foldedSeq || max <= horizon) {
-        rmSync(ordered[i], { force: true });
+    if (highest > segmentHighWater) segmentHighWater = highest;
+
+    // The ordered log is every finalized segment (oldest first) followed by
+    // the active log file.
+    const ordered = segments.map((seg) => seg.path);
+    if (existsSync(logPath)) ordered.push(logPath);
+
+    // The newest anchor — a segment whose first line is a compact ('c') or
+    // truncate ('t') marker for the current snapshot generation — starts the
+    // live suffix of the log. Everything before it is folded into the snapshot
+    // or checkpointed into that marker.
+    let startAt = -1;
+    for (let i = 0; i < ordered.length; i++) {
+      const first = firstEntry(ordered[i]);
+      if (first && (first.t === 'c' || first.t === 't') && first.gen === snapshotGen) {
+        startAt = i;
       }
     }
-  }
 
-  // Recompute retained bytes from the surviving messages after recovery:
-  // snapshot survivors plus messages in finalized segments and the active
-  // log above both the horizon and the folded floor. Torn tails and
-  // uncommitted batches were severed above, so their bytes never count —
-  // usage always matches the messages actually alive.
-  for (const m of baseMessages) {
-    if (m.seq > horizon) usageBytes += Buffer.byteLength(JSON.stringify(m.record), 'utf8');
-  }
-  {
+    if (snapshotGen > 0 && startAt < 0) {
+      // Crash between the snapshot rename and the log reset: every byte still
+      // on disk is already folded into the snapshot. When repairing, reset to
+      // a marker-led log so the state is unambiguous from here on.
+      if (repair) {
+        for (const seg of segments) rmSync(seg.path, { force: true });
+        writeFileSync(logPath, markerLine(snapshotGen));
+      }
+    } else {
+      // Replay the live suffix; a torn tail or uncommitted batch is severed
+      // (physically truncated only when repairing).
+      for (let i = Math.max(startAt, 0); i < ordered.length; i++) {
+        const raw = readFileSync(ordered[i]);
+        const committedEnd = recoverLog(raw, applyRecovered);
+        if (repair && committedEnd < raw.length) truncateSync(ordered[i], committedEnd);
+      }
+      // Reconcile leftovers of an interrupted truncate/compact: finalized
+      // segments before the anchor whose content is folded into the snapshot
+      // or at/below the truncation horizon can go. Segments a consumer still
+      // needs (above the horizon) stay untouched.
+      for (let i = 0; i < startAt; i++) {
+        const max = segmentMaxSeq(ordered[i]);
+        if (max === null || max <= foldedSeq || max <= horizon) {
+          if (repair) rmSync(ordered[i], { force: true });
+        }
+      }
+    }
+
+    // Recompute retained bytes from the surviving messages after recovery:
+    // snapshot survivors plus messages in finalized segments and the active
+    // log above both the horizon and the folded floor. The bracket-aware
+    // scan skips torn tails and uncommitted batches, so their bytes never
+    // count — usage always matches the messages actually alive.
+    for (const m of baseMessages) {
+      if (m.seq > horizon) usageBytes += Buffer.byteLength(JSON.stringify(m.record), 'utf8');
+    }
     const logFloor = Math.max(horizon, foldedSeq);
     const sumFile = (filePath) => {
       if (!existsSync(filePath)) return;
-      const { entries } = parseLog(readFileSync(filePath));
-      for (const entry of entries) {
+      recoverLog(readFileSync(filePath), (entry) => {
         if (entry.t === 'm' && entry.seq > logFloor) usageBytes += entry.bytes;
-      }
+      });
     };
     for (const seg of listSegments()) sumFile(seg.path);
     sumFile(logPath);
-  }
+  };
+
+  // ---- write ownership lease ---------------------------------------------
+  // Opening the bus takes the lease over: the epoch increments with every
+  // takeover and the owner token is unique to this instance, so a previous
+  // holder's credential can never match again — its later appends, batches,
+  // truncations and compactions fail wholesale instead of mixing content
+  // into the log. The lease is written to a temp file and atomically
+  // renamed, so a crash mid-hand-off leaves either the old lease or the new
+  // one; a half-written lease file left by a crashed predecessor is treated
+  // as no lease and simply taken over.
+  let leaseEpoch = 0;
+  const leaseOwner = randomUUID();
+
+  const acquireLease = () => {
+    let previous = 0;
+    try {
+      const current = JSON.parse(readFileSync(leasePath, 'utf8'));
+      if (current && Number.isInteger(current.epoch) && current.epoch > 0) {
+        previous = current.epoch;
+      }
+    } catch {
+      // Missing or half-written lease: nothing valid to build on.
+    }
+    leaseEpoch = previous + 1;
+    const tmpFd = openSync(leaseTmpPath, 'w');
+    try {
+      writeSync(
+        tmpFd,
+        Buffer.from(JSON.stringify({ v: 1, epoch: leaseEpoch, owner: leaseOwner }) + '\n', 'utf8'),
+      );
+      fsyncSync(tmpFd);
+    } finally {
+      closeSync(tmpFd);
+    }
+    renameSync(leaseTmpPath, leasePath);
+  };
+
+  // The credential check every append, batch, truncate and compact passes
+  // before touching disk: the lease on disk must still be the one this
+  // instance wrote. Anything else — taken over, deleted, overwritten —
+  // fails the operation with an Error and leaves the log untouched.
+  const assertOwnership = () => {
+    let current = null;
+    try {
+      current = JSON.parse(readFileSync(leasePath, 'utf8'));
+    } catch {
+      // Unreadable or half-written lease: not ours either way.
+    }
+    if (!current || current.epoch !== leaseEpoch || current.owner !== leaseOwner) {
+      throw new Error('bus: write ownership was taken over by another process');
+    }
+  };
+
+  // ---- synchronous recovery so stats() is correct the moment createBus returns
+  // A missing directory is created; a directory that cannot be created,
+  // read or leased (deleted underneath us, insufficient permissions)
+  // fails the open synchronously with the underlying Error.
+  mkdirSync(dir, { recursive: true });
+  // A leftover lease tmp is a lease hand-off that crashed mid-write; it
+  // carries no state.
+  rmSync(leaseTmpPath, { force: true });
+  recover(true);
+  acquireLease();
 
   // Reassigned by compact()/truncate() when they swap the active log.
   let fd = openSync(logPath, 'a');
@@ -460,6 +564,26 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
         if (closed || broken) {
           throw new Error('bus is closed');
         }
+        // The write is allowed only while this instance still holds the
+        // ownership lease; a taken-over holder fails wholesale and leaves
+        // the log untouched.
+        assertOwnership();
+        // Merge whatever other writers committed since this instance last
+        // touched the directory: dedup keys, positions, retained usage and
+        // the cumulative counters are one shared state.
+        recover(true);
+        // The key may have been committed by another writer (or an earlier
+        // queued operation) since the call-time check: reuse the first
+        // acknowledgement and allocate nothing — exactly the duplicate rule.
+        if (dedupKey !== undefined) {
+          const first = dedup.get(dedupKey);
+          if (first) {
+            const ack = { id: first.id, seq: first.seq };
+            pending.delete(dedupKey);
+            resolveResult(ack);
+            return ack;
+          }
+        }
         // Quota is checked inside the serial job, so a truncate queued
         // earlier releases its bytes before this publish is judged. An
         // exact fit succeeds; one byte over (or a single oversized record)
@@ -573,6 +697,10 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
         if (closed || broken) {
           throw new Error('bus is closed');
         }
+        // Same ownership and merge rules as publish(): the group is planned
+        // against the shared state other writers may have moved.
+        assertOwnership();
+        recover(true);
 
         // Resolve the whole plan against durable state inside the serial
         // job, so groups queued behind earlier publishes/batches observe
@@ -703,6 +831,9 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
         if (closed || broken) {
           throw new Error('bus is closed');
         }
+        // Reads merge whatever other writers committed; replay itself only
+        // appends an order-independent stat line, so no ownership is needed.
+        recover(true);
         // replay(from) is inclusive of from; messagesAfter takes an
         // exclusive lower bound.
         const out = messagesAfter(from - 1);
@@ -723,6 +854,8 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
     register(name) {
       assertOpen();
       assertName(name);
+      // Positions are shared with every other writer of this directory.
+      recover(true);
       const current = positions.get(name);
       // Re-registering an existing name must not reset its position.
       if (current !== undefined) {
@@ -739,6 +872,7 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
       if (typeof to !== 'number' || !Number.isInteger(to) || to < 0) {
         throw new RangeError('advance: position must be a non-negative integer');
       }
+      recover(true);
       const current = positions.get(name);
       if (current !== undefined) {
         if (to < current) {
@@ -757,6 +891,7 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
     read(name) {
       assertOpen();
       assertName(name);
+      recover(true);
       let pos = positions.get(name);
       if (pos === undefined) {
         pos = 0;
@@ -775,6 +910,10 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
         if (closed || broken) {
           throw new Error('bus is closed');
         }
+        // Compaction rewrites the whole log; only the lease holder may do
+        // it, and it folds the merged state of every writer.
+        assertOwnership();
+        recover(true);
         // Fold every surviving message: snapshot contents plus the live log,
         // skipping anything truncation already discarded.
         const messages = [];
@@ -908,6 +1047,11 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
         if (closed || broken) {
           throw new Error('bus is closed');
         }
+        // Retention deletion rewrites the segment chain; only the lease
+        // holder may do it, and it judges consumer hold-back on the merged
+        // positions of every writer.
+        assertOwnership();
+        recover(true);
         const oldHorizon = horizon;
 
         // Truncation deals in whole segments only: seal the active segment
@@ -917,8 +1061,8 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
         if (existsSync(logPath) && statSync(logPath).size > 0) {
           try {
             closeSync(fd);
-            renameSync(logPath, path.join(dir, segmentName(nextSegmentIndex)));
-            nextSegmentIndex += 1;
+            renameSync(logPath, path.join(dir, segmentName(segmentHighWater)));
+            segmentHighWater += 1;
             fd = openSync(logPath, 'a');
           } catch (err) {
             // Recover the append handle if possible; the bus refuses further
@@ -1002,42 +1146,40 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
           broken = true;
           throw err;
         }
-        // Make the roll's and the marker's directory entries durable before
-        // unlinking. Where directory sync is unavailable, keep the segments:
-        // the marker is valid either way, and a later truncate or the next
-        // recovery finishes the job.
-        let dirSynced = false;
+        // Durability of the roll's and the marker's directory entries is
+        // best-effort: some platforms/filesystems expose no directory fsync.
+        // A failed sync must not strand the doomed segments — deletion is
+        // unconditional; the checkpoint marker covers them either way, and a
+        // crash recovers to the marker plus whichever segments remain, both
+        // consistent.
         try {
           const dirFd = openSync(dir, 'r');
           try {
             fsyncSync(dirFd);
-            dirSynced = true;
           } finally {
             closeSync(dirFd);
           }
         } catch {
-          // Deletion is skipped; everything else about the truncate stands.
+          // Directory sync unavailable/failed: deletion still proceeds.
         }
-        if (dirSynced) {
-          for (const seg of doomed) {
-            try {
-              rmSync(seg.path, { force: true });
-            } catch {
-              // Leftovers are filtered by the horizon and cleaned on reopen.
-            }
-          }
-          // Best-effort durability for the unlinks; a crash here recovers to
-          // the marker plus whichever segments remain — both consistent.
+        for (const seg of doomed) {
           try {
-            const dirFd = openSync(dir, 'r');
-            try {
-              fsyncSync(dirFd);
-            } finally {
-              closeSync(dirFd);
-            }
+            rmSync(seg.path, { force: true });
           } catch {
-            // Unlink durability is best-effort; leftovers are harmless.
+            // Leftovers are filtered by the horizon and cleaned on reopen.
           }
+        }
+        // Best-effort durability for the unlinks; a crash here recovers to
+        // the marker plus whichever segments remain — both consistent.
+        try {
+          const dirFd = openSync(dir, 'r');
+          try {
+            fsyncSync(dirFd);
+          } finally {
+            closeSync(dirFd);
+          }
+        } catch {
+          // Unlink durability is best-effort; leftovers are harmless.
         }
         horizon = newHorizon;
         // The discarded segments' business bytes are genuinely gone now
@@ -1055,6 +1197,15 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
     },
 
     stats() {
+      // The four cumulative counters are one merged state across writers,
+      // takeovers and restarts, and never shrink. Best-effort refresh: a
+      // bus whose directory became unreadable (e.g. after close) still
+      // serves its last known state.
+      try {
+        recover(false);
+      } catch {
+        // Serve the last known state.
+      }
       return { seq, bytes, published, replayed };
     },
 
@@ -1062,6 +1213,11 @@ export function createBus({ path: dir, fsync = false, maxBytes } = {}) {
     // retention truncation). Compaction does not change it; an empty bus is
     // zero. Readable after close, like stats().
     usage() {
+      try {
+        recover(false);
+      } catch {
+        // Serve the last known state.
+      }
       return usageBytes;
     },
 
